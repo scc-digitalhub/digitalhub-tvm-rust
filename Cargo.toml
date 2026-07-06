@@ -1,0 +1,31 @@
+# Rust workspace for the native TVM serving image (tvm-runtime-rust), used by
+# the DigitalHub tvm+serve task as the default serve backend.
+#
+#   crates/tvm-relax  - inference library: thin wrapper over tvm-ffi that loads
+#                       a Relax model.so and drives the VirtualMachine.
+#   crates/tvm-serve  - OpenInference v2 server binary (REST 8080 / gRPC 9000).
+#
+# build-image.sh compiles tvm-serve and packages it with the TVM runtime libs
+# into the tvm-runtime-rust image (see README.md).
+[workspace]
+resolver = "2"
+members = ["crates/tvm-relax", "crates/tvm-serve"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# tvm-ffi (the Rust bindings) must be ABI-coherent with the libtvm_ffi.so we
+# link against. The path points at the `tvm-current` symlink naming the active
+# TVM version; create/update it by hand with:
+#   ln -sfn tvm-0.24.0 ~/tvm/src/tvm-current
+tvm-ffi = { path = "/home/ltrubbiani/tvm/src/tvm-current/3rdparty/tvm-ffi/rust/tvm-ffi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

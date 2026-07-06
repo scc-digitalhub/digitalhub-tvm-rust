@@ -1,0 +1,8 @@
+target
+crates
+scripts
+Cargo.toml
+Cargo.lock
+*.sh
+*.md
+.git
