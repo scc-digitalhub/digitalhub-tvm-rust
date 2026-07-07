@@ -24,40 +24,43 @@ CORE's `tvm+serve` needs a base image that can take a freshly compiled Relax
 - model-agnostic — the model is injected at deploy time (init container), not
   baked;
 - serves OpenInference v2 over REST and gRPC from the same process;
-- **CPU + FP32 only**.
+- **CPU only**, native dtypes (FP16 deferred).
 
 ## Architecture
 
 ```
                     ┌──────────────────────────── tvm-serve process ───────────────────────────┐
-                    │                                                                            │
-  HTTP :8080  ─────▶│  axum REST server ─┐                                                       │
-  (OpenInf v2)      │  (protocol.rs)     │                                                       │
-                    │                    ├──▶ Arc<Handle> ──▶ mpsc channel ──▶  tvm-infer thread │
-  gRPC :9000  ─────▶│  tonic gRPC server ┘   (Send jobs:        (worker.rs)     (owns the model) │
-  (GRPCInference)   │  (grpc.rs)             Vec<f32>+shape)                          │           │
-                    │                                                                ▼           │
-                    │                                                   RelaxModel (tvm-relax)   │
-                    │                                                   model.so + Relax VM      │
+                    │                                                                          │
+  HTTP :8080  ─────▶│  axum REST server ─┐                                                     │
+  (OpenInf v2)      │  (protocol.rs)     │                                                     │
+                    │                    ├──▶ Arc<Handle> ──▶ shared queue ──▶ worker pool     │
+  gRPC :9000  ─────▶│  tonic gRPC server ┘   (Send jobs:      (mpsc)          (N threads)      │
+  (GRPCInference)   │  (grpc.rs)             typed data+shape)                each own a       │
+                    │                                                         model copy       │
+                    │                                                                          │
+                    │                                          RelaxModel (tvm-relax) × N      │
+                    │                                          model.so + Relax VM             │
                     └────────────────────────────────────────────────────────────────┼─────────┘
-                                                                                       │ tvm-ffi C ABI
-                                                                              libtvm_runtime.so
-                                                                              libtvm_ffi.so
+                                                                                      │ tvm-ffi C ABI
+                                                                             libtvm_runtime.so
+                                                                             libtvm_ffi.so
 ```
 
-Two async servers (REST + gRPC) share **one** model. The TVM VM and all `tvm-ffi`
-handles are **not `Send`/`Sync`**, so the model is loaded on a single dedicated OS
-thread and never crosses threads. REST and gRPC handlers submit inference jobs to
-that thread over an mpsc channel (an actor pattern); the channel only carries
-`Send` data (`Vec<f32>` + shape). Inferences are therefore **serialized** — one at
-a time.
+Two async servers (REST + gRPC) share a **pool of worker threads**. The TVM VM and
+all `tvm-ffi` handles are **not `Send`/`Sync`**, so each worker loads its **own copy**
+of the model on a dedicated OS thread and never crosses threads. REST and gRPC
+handlers submit inference jobs to a **shared mpsc queue** that all workers drain (an
+actor pattern); the channel only carries `Send` data (typed tensor bytes + shape).
+With **N** workers up to N inferences run concurrently, at the cost of N model
+copies in memory. The pool size is set by `TVM_SERVE_WORKERS` (default `1`); with a
+single worker inferences are serialized — one at a time.
 
 ### Crates
 
 | Crate | Path | Role |
 |-------|------|------|
-| `tvm-relax` | `crates/tvm-relax` | The `RelaxModel` inference library. Loads `model.so` and drives the Relax VirtualMachine through raw `PackedFunc` calls over the `tvm-ffi` C ABI. `src/lib.rs` is the core; `build.rs` force-links `libtvm_runtime`. `examples/poc.rs` is a standalone GO/NO-GO check. |
-| `tvm-serve` | `crates/tvm-serve` | The server binary. `main.rs` reads env config, loads the model on a worker thread, starts REST + gRPC. `worker.rs` is the model-owning thread + inference channel. `protocol.rs` has the REST OpenInference v2 handlers and the v2 JSON structs. `grpc.rs` implements the gRPC `GRPCInferenceService`. `build.rs` compiles the proto and repeats the native link setup. |
+| `tvm-relax` | `crates/tvm-relax` | The `RelaxModel` inference library. Loads `model.so` and drives the Relax VirtualMachine through raw `PackedFunc` calls over the `tvm-ffi` C ABI. `src/lib.rs` is the core; `build.rs` force-links `libtvm_runtime`. |
+| `tvm-serve` | `crates/tvm-serve` | The server binary. `main.rs` reads env config, spins up the worker pool (each thread loads its own model copy), starts REST + gRPC. `worker.rs` is the pool of model-owning threads + the shared inference queue. `protocol.rs` has the REST OpenInference v2 handlers and the v2 JSON structs. `grpc.rs` implements the gRPC `GRPCInferenceService`. `build.rs` compiles the proto and repeats the native link setup. |
 
 ### The crux: driving the Relax VM from Rust
 
@@ -102,7 +105,7 @@ It requires a **locally-built TVM** — the script copies `libtvm_runtime.so` an
 |---------|---------|---------|
 | `TVM_HOME` | `$HOME/tvm/src/tvm-current` | Root of the local TVM checkout/build |
 | `TVM_BUILD` | `$TVM_HOME/build` | TVM build dir (must contain `lib/libtvm_runtime.so`) |
-| `TVM_TAG` | derived from `TVM_HOME` (e.g. `tvm-0.24.0` -> `0.24`) | Image tag `major.minor`, matches the packaged TVM |
+| `TVM_TAG` | derived from `TVM_HOME` (e.g. `tvm-0.25.0` -> `0.25`) | Image tag `major.minor`, matches the packaged TVM |
 | `TAG` | `tvm-runtime-rust:$TVM_TAG` | Full image name:tag |
 | `REGISTRY` | *(empty)* | Push prefix for `--push`: the pushed ref is `$REGISTRY/$TAG`; when empty the bare `$TAG` is pushed |
 
@@ -137,7 +140,7 @@ is a build-free, model-injection pattern:
 
 The base serve image is configured by **`runtime.tvm.serve`** (env
 `RUNTIME_TVM_SERVE`), defaulting to
-`ghcr.io/scc-digitalhub/tvm-runtime-rust:0.24`. A `tvm+serve` task can override it
+`ghcr.io/scc-digitalhub/tvm-runtime-rust:0.25`. A `tvm+serve` task can override it
 per-run via `task.image`.
 
 ### Runtime env config (read by `tvm-serve`)
@@ -148,6 +151,7 @@ per-run via `task.image`.
 | `TVM_MODEL_NAME` | `tvm-model` | Name in `/v2/models/<name>` |
 | `TVM_SERVE_PORT` | `8080` | REST port |
 | `TVM_SERVE_GRPC_PORT` | `9000` | gRPC port |
+| `TVM_SERVE_WORKERS` | `1` | Worker threads in the pool (each loads its own model copy); up to N concurrent inferences. Wired from the `tvm+serve` spec field `task.workers`. |
 
 ## OpenInference v2 endpoints
 
@@ -163,7 +167,9 @@ REST (axum) and gRPC (`inference.GRPCInferenceService`) expose the same v2 surfa
 | Infer | `POST /v2/models/:name/infer` (and `/versions/:version/infer`) | `ModelInfer` |
 
 Inputs are matched **positionally** (client sends tensors in `metadata.inputs`
-order). Input `datatype` must be `FP32`. Message limits are raised well above the
+order). Input `datatype` may be any of the supported native dtypes — `FP32`,
+`FP64`, `INT8`/`INT16`/`INT32`/`INT64`, `UINT8`/`UINT16`/`UINT32`/`UINT64`; `FP16`
+is not yet supported and is rejected with a clear error. Message limits are raised well above the
 protocol defaults: REST body limit **1 GiB**, gRPC max message **512 MB** (v2
 tensors easily exceed the 2 MB / 4 MB defaults). The gRPC server does **not**
 expose server reflection, so clients need the `.proto`
@@ -185,10 +191,13 @@ python3 run_infer.py --mode grpc     # gRPC
 
 ## Limitations
 
-- **CPU + FP32 only.** The VM is initialized on `kDLCPU`; the worker builds input
-  tensors as `float32` and reads outputs as `f32`. No GPU, no other dtypes.
-- **Single in-flight inference** (one worker thread). No multi-worker pool, no
-  batching, no metrics — these are future work.
+- **CPU only.** The VM is initialized on `kDLCPU`. No GPU.
+- **Native dtypes, FP16 deferred.** `FP32`/`FP64`, `INT8`/`INT16`/`INT32`/`INT64`
+  and `UINT8`/`UINT16`/`UINT32`/`UINT64` are supported. `FP16` needs an unsafe
+  half path in Rust and is currently rejected with a clear error.
+- **One model per pod, no batching, no metrics** — these remain future work.
+  Concurrency is available within a pod via the worker pool (`TVM_SERVE_WORKERS`)
+  and across pods via `replicas`.
 
 ## Relation to the Go runtime
 

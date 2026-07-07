@@ -6,6 +6,7 @@
 //! TVM_MODEL_NAME       model name in /v2/models/<name> (default tvm-model)
 //! TVM_SERVE_PORT       REST port (default 8080)
 //! TVM_SERVE_GRPC_PORT  gRPC port (default 9000)
+//! TVM_SERVE_WORKERS    inference workers / model copies (default 1)
 //! ```
 mod grpc;
 mod protocol;
@@ -26,8 +27,8 @@ use protocol::{
 };
 use worker::{Handle, InferInput, ServeErr};
 
-// Per-request axum state. Cloned on every request, so the single model-owning
-// worker is shared (not duplicated) behind an `Arc<Handle>`.
+// Per-request axum state, cloned on every request. The `Arc<Handle>` keeps the
+// worker pool shared, not duplicated — the handle just enqueues jobs.
 #[derive(Clone)]
 struct AppState {
     handle: Arc<Handle>,
@@ -39,9 +40,10 @@ async fn main() -> anyhow::Result<()> {
     let model_name = std::env::var("TVM_MODEL_NAME").unwrap_or_else(|_| "tvm-model".to_string());
     let port = env_u16("TVM_SERVE_PORT", 8080);
     let grpc_port = env_u16("TVM_SERVE_GRPC_PORT", 9000);
+    let workers = env_usize("TVM_SERVE_WORKERS", 1);
 
-    eprintln!("[tvm-serve] loading model from {model_dir} (name='{model_name}')...");
-    let handle = worker::start(&model_dir, model_name)?;
+    eprintln!("[tvm-serve] loading model from {model_dir} (name='{model_name}', workers={workers})...");
+    let handle = worker::start(&model_dir, model_name, workers)?;
     eprintln!(
         "[tvm-serve] model ready: entry='{}' inputs={:?} outputs={:?}",
         handle.metadata.entry,
@@ -96,9 +98,8 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("[tvm-serve] REST on http://{rest_addr}  ·  gRPC on {grpc_addr}");
 
-    // Run both servers concurrently. Whichever branch resolves first wins and
-    // the others are dropped: a fatal error from either server, or Ctrl-C /
-    // SIGINT, tears the whole process down.
+    // Run both servers concurrently; the first branch to resolve tears the whole
+    // process down — a fatal error from either server, or Ctrl-C.
     tokio::select! {
         res = axum::serve(listener, app) => res?,
         res = grpc_server => res?,
@@ -119,6 +120,16 @@ fn env_u16(key: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+// Read a positive usize from an env var, falling back to `default` if it is
+// unset, unparsable, or zero (a pool must have at least one worker).
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(default)
+}
+
 async fn server_metadata() -> Json<ServerMetadata> {
     Json(ServerMetadata {
         name: "tvm-serve".to_string(),
@@ -127,8 +138,8 @@ async fn server_metadata() -> Json<ServerMetadata> {
     })
 }
 
-// Map a model's declared tensor spec (from metadata.json) onto the v2 wire
-// metadata shape, translating the TVM dtype to its Open Inference name.
+// Turn a model's declared tensor spec into v2 wire metadata, translating the
+// TVM dtype to its Open Inference name.
 fn to_tensor_metadata(s: &tvm_relax::TensorSpec) -> TensorMetadata {
     TensorMetadata {
         name: s.name.clone(),
@@ -178,10 +189,9 @@ async fn infer_versioned(
     do_infer(&state, &name, req).await
 }
 
-// Shared body for both the versioned and unversioned /infer routes: decode the
-// tensors, run them through the shared validate+infer path (`Handle::serve_infer`),
-// and shape the reply. The awaited call keeps this async handler off the blocking,
-// non-Send inference thread.
+// Shared by the versioned and unversioned /infer routes: decode the tensors, run
+// them through `Handle::serve_infer`, and shape the reply. Awaiting keeps this
+// handler off the blocking, non-Send inference thread.
 async fn do_infer(
     state: &AppState,
     name: &str,
@@ -189,8 +199,10 @@ async fn do_infer(
 ) -> Result<Json<InferResponse>, (StatusCode, String)> {
     let mut inputs: Vec<InferInput> = Vec::with_capacity(req.inputs.len());
     for i in req.inputs {
-        let mut data = Vec::new();
-        protocol::flatten_f32(&i.data, &mut data).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        // Parse the v2 data into a typed buffer matching its declared datatype
+        // (FP32/FP64, INT8..64, UINT8..64); rejects FP16/unknown with a 400.
+        let data = protocol::TensorData::from_json(&i.data, &i.datatype)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         inputs.push(InferInput {
             name: i.name,
             datatype: i.datatype,
@@ -213,7 +225,7 @@ async fn do_infer(
             name: o.name,
             shape: o.shape,
             datatype: o.datatype,
-            data: o.data,
+            data: o.data.to_json(),
         })
         .collect();
 

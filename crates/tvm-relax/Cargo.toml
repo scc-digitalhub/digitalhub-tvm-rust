@@ -11,8 +11,3 @@ tvm-ffi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-
-# PoC Fase 0: GO/NO-GO del runtime in Rust contro la reference di TVM Python.
-[[example]]
-name = "poc"
-path = "examples/poc.rs"

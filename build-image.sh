@@ -4,11 +4,11 @@
 # (REST 8080 / gRPC 9000). Model-centric — nothing model-specific is baked.
 #
 # Usage: ./build-image.sh [--load] [--push]
-#   TAG=<repo:tag>         image name         (default tvm-runtime-rust:0.24)
+#   TAG=<repo:tag>         image name         (default tvm-runtime-rust:0.25)
 #   REGISTRY=<host[/org]>  push target prefix (the pushed ref is $REGISTRY/$TAG)
 #   --load  -> minikube image load (local dev)     --push -> push to the registry
 # Remote cluster: build, --push to your registry, then point CORE at the exact
-# pushed ref via RUNTIME_TVM_SERVE (e.g. RUNTIME_TVM_SERVE=ghcr.io/acme/tvm-runtime-rust:0.24).
+# pushed ref via RUNTIME_TVM_SERVE (e.g. RUNTIME_TVM_SERVE=ghcr.io/acme/tvm-runtime-rust:0.25).
 # Requires a locally-built TVM (override with TVM_HOME / TVM_BUILD).
 set -euo pipefail
 
@@ -16,11 +16,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TVM_HOME="${TVM_HOME:-$HOME/tvm/src/tvm-current}"
 TVM_BUILD="${TVM_BUILD:-$TVM_HOME/build}"
 # Default tag = major.minor of the TVM actually packaged (resolved from the
-# TVM_HOME dir name, e.g. tvm-0.24.0 -> 0.24), so the image tag always matches
+# TVM_HOME dir name, e.g. tvm-0.25.0 -> 0.25), so the image tag always matches
 # its contents. Override with TVM_TAG or a full TAG.
 if [ -z "${TVM_TAG:-}" ]; then
     _v="$(basename "$(readlink -f "$TVM_HOME")")"; _v="${_v#tvm-}"
-    if [[ "$_v" =~ ^[0-9]+\.[0-9]+ ]]; then TVM_TAG="${_v%.*}"; else TVM_TAG="0.24"; fi
+    if [[ "$_v" =~ ^[0-9]+\.[0-9]+ ]]; then TVM_TAG="${_v%.*}"; else TVM_TAG="0.25"; fi
 fi
 TAG="${TAG:-tvm-runtime-rust:${TVM_TAG}}"
 REGISTRY="${REGISTRY:-}" # empty = push bare $TAG; set host[/org] to push for a remote cluster

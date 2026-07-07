@@ -3,13 +3,13 @@
 # `tvm-ffi-sys/build.rs` lo invoca (`tvm-ffi-config --libdir`) per trovare
 # libtvm_ffi.so / libtvm_ffi_testing.so da linkare.
 #
-# Restituiamo la dir lib della build TVM 0.24.0. Override via env:
+# Restituiamo la dir lib della build TVM attiva (symlink tvm-current). Override via env:
 #   TVM_FFI_LIBDIR, TVM_FFI_INCLUDEDIR
 #
 # Va reso raggiungibile su PATH quando si compila il workspace Rust, es.:
-#   PATH="$(pwd)/scripts:$PATH" cargo build --release --example poc
-LIBDIR="${TVM_FFI_LIBDIR:-/home/ltrubbiani/tvm/src/tvm-0.24.0/build/lib}"
-INCDIR="${TVM_FFI_INCLUDEDIR:-/home/ltrubbiani/tvm/src/tvm-0.24.0/3rdparty/tvm-ffi/include}"
+#   PATH="$(pwd)/scripts:$PATH" cargo build --release
+LIBDIR="${TVM_FFI_LIBDIR:-/home/ltrubbiani/tvm/src/tvm-current/build/lib}"
+INCDIR="${TVM_FFI_INCLUDEDIR:-/home/ltrubbiani/tvm/src/tvm-current/3rdparty/tvm-ffi/include}"
 case "$1" in
   --libdir) echo "$LIBDIR" ;;
   --includedir) echo "$INCDIR" ;;

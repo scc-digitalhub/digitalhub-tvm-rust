@@ -52,7 +52,7 @@ fn default_dtype() -> String {
 }
 
 /// One input or output tensor as described by `metadata.json`. `dtype`
-/// defaults to `float32` since this runtime is FP32-only.
+/// defaults to `float32` when absent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TensorSpec {
     pub name: String,
@@ -78,13 +78,12 @@ impl Metadata {
     }
 }
 
-/// A loaded model ready for inference. The handles are all reference-counted
-/// TVM objects; we keep the DSO and the VM modules alive for the whole lifetime
-/// of the model even though only `entry` is called directly, because the VM and
-/// the entry function borrow into them.
+/// A loaded model ready for inference. The handles are reference-counted TVM
+/// objects; `entry` borrows into the VM, which borrows into the DSO, so we keep
+/// all three alive even though only `entry` is called directly.
 ///
-/// None of these handles are `Send`/`Sync`, which is why the server owns a
-/// `RelaxModel` on a single dedicated inference thread.
+/// None of these handles are `Send`/`Sync`, so the server owns a `RelaxModel`
+/// on a single dedicated inference thread.
 pub struct RelaxModel {
     /// The compiled `model.so`; kept alive because the VM lives inside it.
     _lib: Module,
@@ -148,13 +147,5 @@ impl RelaxModel {
             tensors.push(ffi(arr.get(i))?);
         }
         Ok(tensors)
-    }
-
-    /// Convenience for single-output models.
-    pub fn run_single(&self, input: &Tensor) -> Result<Tensor> {
-        self.run(std::slice::from_ref(input))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Tvm("VM produced no output".to_string()))
     }
 }

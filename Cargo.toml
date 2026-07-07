@@ -20,7 +20,7 @@ rust-version = "1.80"
 # tvm-ffi (the Rust bindings) must be ABI-coherent with the libtvm_ffi.so we
 # link against. The path points at the `tvm-current` symlink naming the active
 # TVM version; create/update it by hand with:
-#   ln -sfn tvm-0.24.0 ~/tvm/src/tvm-current
+#   ln -sfn tvm-0.25.0 ~/tvm/src/tvm-current
 tvm-ffi = { path = "/home/ltrubbiani/tvm/src/tvm-current/3rdparty/tvm-ffi/rust/tvm-ffi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
