@@ -1,17 +1,14 @@
 //! Thin Rust wrapper over `tvm-ffi` to load and run a compiled TVM Relax
 //! `model.so` through the Relax VirtualMachine.
 //!
-//! There is no high-level Rust binding for the Relax VM, so everything is done
-//! by name over the tvm-ffi C ABI: we ask the loaded module for named
-//! `PackedFunc`s (`vm_load_executable`, `vm_initialization`, and the model's
-//! entry function) and call them with type-erased `Any`/`AnyView` values. The
-//! four-step dance mirrors what the TVM C++ runtime does internally:
+//! No high-level Rust binding exists for the Relax VM, so it's driven by name
+//! over the tvm-ffi C ABI, mirroring the C++ runtime:
 //!
 //! ```text
-//!   lib  = Module::load_from_file("model.so")   // the compiled DSO
-//!   vm   = lib["vm_load_executable"]()          // instantiate the Relax VM module
-//!          vm["vm_initialization"](devtype, devid, alloc, …)  // bind device + allocator
-//!   out  = vm[entry](inputs…)                   // run the model's entry function
+//!   lib  = Module::load_from_file("model.so")
+//!   vm   = lib["vm_load_executable"]()
+//!          vm["vm_initialization"](devtype, devid, alloc, …)
+//!   out  = vm[entry](inputs…)
 //! ```
 
 use serde::Deserialize;
@@ -78,12 +75,9 @@ impl Metadata {
     }
 }
 
-/// A loaded model ready for inference. The handles are reference-counted TVM
-/// objects; `entry` borrows into the VM, which borrows into the DSO, so we keep
-/// all three alive even though only `entry` is called directly.
-///
-/// None of these handles are `Send`/`Sync`, so the server owns a `RelaxModel`
-/// on a single dedicated inference thread.
+/// A loaded model ready for inference. `entry` borrows into the VM, which borrows
+/// into the DSO, so all three are kept alive. None are `Send`/`Sync`, so a
+/// `RelaxModel` lives on one dedicated inference thread.
 pub struct RelaxModel {
     /// The compiled `model.so`; kept alive because the VM lives inside it.
     _lib: Module,
@@ -98,15 +92,11 @@ impl RelaxModel {
     pub fn load(so_path: &str, entry: &str) -> Result<Self> {
         let lib = ffi(Module::load_from_file(so_path))?;
 
-        // `vm_load_executable` is a PackedFunc exported by the DSO; calling it
-        // with no args returns the Relax VM as another Module.
         let loader = ffi(lib.get_function("vm_load_executable"))?;
         let vm: Module = ffi(loader.call_packed(&[]).and_then(|any| any.try_into()))?;
 
-        // vm_initialization takes one (device_type, device_id, alloc_type)
-        // triple per device. The C++ runtime always passes the compute device
-        // followed by the host device; both are CPU here, so we send the same
-        // triple twice.
+        // vm_initialization wants one (device_type, device_id, alloc_type) triple
+        // per device: compute then host. Both are CPU, so the same triple twice.
         let init = ffi(vm.get_function("vm_initialization"))?;
         ffi(init.call_tuple((
             KDLCPU,
@@ -117,8 +107,7 @@ impl RelaxModel {
             ALLOC_POOLED,
         )))?;
 
-        // Resolve the entry PackedFunc once here rather than by name on every
-        // `run`, so inference is a direct call.
+        // Resolve the entry PackedFunc once, so `run` is a direct call.
         let entry_fn = ffi(vm.get_function(entry))?;
 
         Ok(Self {
@@ -131,13 +120,11 @@ impl RelaxModel {
     /// Multi-input / multi-output inference. Relax returns either a single
     /// Tensor or an Array of Tensors; we normalize both to a Vec.
     pub fn run(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
-        // The entry PackedFunc takes type-erased args, so borrow each input
-        // Tensor as an AnyView (no copy) and pass the slice positionally.
+        // Borrow each input as an AnyView (no copy) for the type-erased entry.
         let views: Vec<AnyView> = inputs.iter().map(AnyView::from).collect();
         let out = ffi(self.entry.call_packed(&views))?;
 
-        // Single-output models return a bare Tensor; try that first, otherwise
-        // treat the result as an Array and unpack each element.
+        // Single-output models return a bare Tensor; try that, else unpack an Array.
         if let Some(t) = AnyView::from(&out).try_as::<Tensor>() {
             return Ok(vec![t]);
         }

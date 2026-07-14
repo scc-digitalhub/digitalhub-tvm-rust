@@ -86,23 +86,15 @@ impl GrpcInferenceService for InferenceService {
         }))
     }
 
-    // gRPC counterpart of the REST `do_infer`: decode the tensors (raw bytes or
-    // typed contents, per datatype), run them through the shared validate+infer
-    // path, and encode each output into the matching typed contents field
-    // (raw_output_contents left empty).
+    // gRPC counterpart of the REST `do_infer`; shares the validate+infer path.
     async fn model_infer(
         &self,
         r: Request<ModelInferRequest>,
     ) -> Result<Response<ModelInferResponse>, Status> {
         let req = r.into_inner();
 
-        // gRPC clients send tensor payloads one of two ways, and we accept both:
-        //  - raw_input_contents[i]: opaque little-endian bytes of the tensor's
-        //    dtype (what most KServe clients use), or
-        //  - inputs[i].contents: the typed repeated field for that dtype.
-        // If raw_input_contents is present at all it takes precedence for every
-        // input, matching the KServe spec. Model-name/count/shape checks live in
-        // Handle::serve_infer, so only wire decoding happens here.
+        // Two accepted encodings: raw_input_contents (LE bytes) or inputs[i].contents
+        // (typed field). Per KServe, if raw is present at all it wins for every input.
         let use_raw = !req.raw_input_contents.is_empty();
         let mut inputs = Vec::with_capacity(req.inputs.len());
         for (i, t) in req.inputs.iter().enumerate() {
@@ -152,7 +144,6 @@ impl GrpcInferenceService for InferenceService {
     }
 }
 
-// Map the shared worker error onto a gRPC Status.
 fn serve_err_status(e: crate::worker::ServeErr) -> Status {
     use crate::worker::ServeErr;
     match e {
@@ -162,10 +153,9 @@ fn serve_err_status(e: crate::worker::ServeErr) -> Status {
     }
 }
 
-// Decode one gRPC input tensor into typed data. Raw little-endian bytes (if
-// present) take precedence; otherwise the dtype's typed `contents` field is used.
-// gRPC packs INT8/16/32 in int_contents (i32) and UINT8/16/32 in uint_contents
-// (u32), so those are narrowed to the declared width. FP16 is rejected (deferred).
+// Decode one gRPC input tensor. Raw LE bytes win if present, else the typed
+// `contents`. gRPC packs INT8/16/32 in int_contents and UINT8/16/32 in
+// uint_contents, so those narrow to the declared width; FP16 rejected.
 fn tensor_data_from_grpc(
     datatype: &str,
     contents: Option<&InferTensorContents>,
@@ -234,8 +224,8 @@ fn tensor_data_from_raw(datatype: &str, raw: &[u8]) -> Result<TensorData, String
     }
 }
 
-// Encode typed output data into the gRPC contents field matching its dtype
-// (INT8/16/32 packed into int_contents, UINT8/16/32 into uint_contents).
+// Encode output data into the gRPC contents field for its dtype (INT8/16/32 into
+// int_contents, UINT8/16/32 into uint_contents).
 fn tensor_data_to_contents(data: TensorData) -> InferTensorContents {
     let mut c = InferTensorContents::default();
     match data {

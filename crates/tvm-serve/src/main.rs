@@ -27,8 +27,7 @@ use protocol::{
 };
 use worker::{Handle, InferInput, ServeErr};
 
-// Per-request axum state, cloned on every request. The `Arc<Handle>` keeps the
-// worker pool shared, not duplicated — the handle just enqueues jobs.
+// Cloned per request; the `Arc<Handle>` shares one worker pool.
 #[derive(Clone)]
 struct AppState {
     handle: Arc<Handle>,
@@ -98,8 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("[tvm-serve] REST on http://{rest_addr}  ·  gRPC on {grpc_addr}");
 
-    // Run both servers concurrently; the first branch to resolve tears the whole
-    // process down — a fatal error from either server, or Ctrl-C.
+    // First branch to resolve tears the process down (fatal error or Ctrl-C).
     tokio::select! {
         res = axum::serve(listener, app) => res?,
         res = grpc_server => res?,
@@ -112,7 +110,6 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-// Read a u16 from an env var, falling back to `default` if it is unset or unparsable.
 fn env_u16(key: &str, default: u16) -> u16 {
     std::env::var(key)
         .ok()
@@ -120,8 +117,7 @@ fn env_u16(key: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-// Read a positive usize from an env var, falling back to `default` if it is
-// unset, unparsable, or zero (a pool must have at least one worker).
+// Clamps to >= 1: the pool needs at least one worker.
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -138,8 +134,6 @@ async fn server_metadata() -> Json<ServerMetadata> {
     })
 }
 
-// Turn a model's declared tensor spec into v2 wire metadata, translating the
-// TVM dtype to its Open Inference name.
 fn to_tensor_metadata(s: &tvm_relax::TensorSpec) -> TensorMetadata {
     TensorMetadata {
         name: s.name.clone(),
@@ -189,9 +183,7 @@ async fn infer_versioned(
     do_infer(&state, &name, req).await
 }
 
-// Shared by the versioned and unversioned /infer routes: decode the tensors, run
-// them through `Handle::serve_infer`, and shape the reply. Awaiting keeps this
-// handler off the blocking, non-Send inference thread.
+// Shared by both /infer routes; awaiting keeps this off the non-Send worker thread.
 async fn do_infer(
     state: &AppState,
     name: &str,
@@ -199,8 +191,6 @@ async fn do_infer(
 ) -> Result<Json<InferResponse>, (StatusCode, String)> {
     let mut inputs: Vec<InferInput> = Vec::with_capacity(req.inputs.len());
     for i in req.inputs {
-        // Parse the v2 data into a typed buffer matching its declared datatype
-        // (FP32/FP64, INT8..64, UINT8..64); rejects FP16/unknown with a 400.
         let data = protocol::TensorData::from_json(&i.data, &i.datatype)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         inputs.push(InferInput {
@@ -237,7 +227,6 @@ async fn do_infer(
     }))
 }
 
-// Map the shared worker error onto a REST status code + message.
 fn serve_err_http(e: ServeErr) -> (StatusCode, String) {
     match e {
         ServeErr::NotFound(m) => (StatusCode::NOT_FOUND, m),

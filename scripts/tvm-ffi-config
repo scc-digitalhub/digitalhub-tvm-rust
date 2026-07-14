@@ -1,12 +1,5 @@
 #!/bin/sh
-# Shim per `tvm-ffi-config` — NON è prodotto dalla build cmake di TVM, ma
-# `tvm-ffi-sys/build.rs` lo invoca (`tvm-ffi-config --libdir`) per trovare
-# libtvm_ffi.so / libtvm_ffi_testing.so da linkare.
-#
-# Restituiamo la dir lib della build TVM attiva (symlink tvm-current). Override via env:
-#   TVM_FFI_LIBDIR
-#
-# Va reso raggiungibile su PATH quando si compila il workspace Rust, es.:
-#   PATH="$(pwd)/scripts:$PATH" cargo build --release
+# Shim `tvm-ffi-config` (non prodotto da cmake): tvm-ffi-sys/build.rs lo invoca
+# per trovare libtvm_ffi.so. Metterlo su PATH quando si compila; override TVM_FFI_LIBDIR.
 LIBDIR="${TVM_FFI_LIBDIR:-/home/ltrubbiani/tvm/src/tvm-current/build/lib}"
 echo "$LIBDIR"

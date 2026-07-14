@@ -1,12 +1,10 @@
 //! Open Inference v2 (KServe) protocol types, REST/JSON subset. Tensor `data` is
-//! carried as [`TensorData`], a typed buffer covering the native dtypes this
-//! serve image supports (FP32/FP64, INT8/16/32/64, UINT8/16/32/64). FP16 and
-//! BOOL are intentionally unsupported for now (FP16 needs an unsafe half path in
-//! rust; add it as a follow-up).
+//! carried as [`TensorData`] over the native dtypes this image supports; FP16/BOOL
+//! are unsupported.
 use serde::{Deserialize, Serialize};
 
-// Some v2 fields are accepted for protocol compatibility but not consumed:
-// (outputs) all outputs are returned; (parameters) none are honored.
+// v2 `outputs`/`parameters` request fields are accepted but ignored (serde drops
+// unknown fields); the server always returns every model output.
 #[derive(Debug, Deserialize)]
 pub struct InferRequest {
     #[serde(default)]
@@ -25,10 +23,8 @@ pub struct RequestInput {
     pub data: serde_json::Value,
 }
 
-/// Typed tensor payload for the native dtypes this serve image supports. FP16
-/// and BOOL are intentionally absent (FP16 deferred; BOOL is not a model I/O
-/// here). Kept transport-agnostic (no tvm-ffi types) so both the REST and gRPC
-/// handlers build and consume it; the worker maps it to/from a TVM `Tensor`.
+/// Typed tensor payload for the supported native dtypes. Transport-agnostic (no
+/// tvm-ffi types) so REST and gRPC share it; the worker maps it to/from a TVM `Tensor`.
 #[derive(Debug)]
 pub enum TensorData {
     F32(Vec<f32>),
@@ -60,10 +56,9 @@ impl TensorData {
         }
     }
 
-    /// Parse a v2 request input's `data` (flat or nested arrays of numbers) into a
-    /// typed buffer matching the v2 `datatype`. Integer types read JSON integers
-    /// directly (so INT64 keeps full precision) with a float fallback, so `1.0` is
-    /// accepted in an integer slot. FP16 is rejected (deferred).
+    /// Parse a v2 input's `data` (flat or nested numbers) into a typed buffer per
+    /// `datatype`. Integers read directly (INT64 keeps full precision) with a float
+    /// fallback so `1.0` is accepted in an integer slot; FP16 is rejected.
     pub fn from_json(v: &serde_json::Value, datatype: &str) -> Result<TensorData, String> {
         let mut nums: Vec<&serde_json::Number> = Vec::new();
         collect_numbers(v, &mut nums)?;
@@ -105,8 +100,7 @@ impl TensorData {
     }
 }
 
-// JSON integers larger than i64/u64 arrive as floats; the float fallback keeps
-// `1.0` acceptable in an integer slot without silently mangling big integers.
+// Float fallback: accepts `1.0` in an integer slot; ints keep full precision.
 fn as_i64(n: &serde_json::Number) -> Option<i64> {
     n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))
 }
@@ -115,7 +109,6 @@ fn as_u64(n: &serde_json::Number) -> Option<u64> {
     n.as_u64().or_else(|| n.as_f64().map(|f| f as u64))
 }
 
-// Recursively collect the leaf numbers of a (possibly nested) v2 data array.
 fn collect_numbers<'a>(
     v: &'a serde_json::Value,
     out: &mut Vec<&'a serde_json::Number>,
@@ -188,10 +181,9 @@ pub struct ServerMetadata {
     pub extensions: Vec<String>,
 }
 
-/// Validates one input tensor's shape against its data length: non-negative dims
-/// and `product(shape) == data_len`, with an overflow-checked product. Guards
-/// tensor construction against huge/overflowing allocations driven by a
-/// malformed client `shape` (which would otherwise segfault the worker thread).
+/// Validates shape vs data length: non-negative dims and overflow-checked
+/// `product(shape) == data_len`. Guards tensor construction from a malformed
+/// client shape that would otherwise overflow/segfault the worker.
 pub fn validate_shape(idx: usize, shape: &[i64], data_len: usize) -> Result<(), String> {
     let mut numel: i64 = 1;
     for &d in shape {

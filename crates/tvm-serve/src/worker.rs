@@ -1,11 +1,8 @@
 //! Inference worker pool on dedicated OS threads.
 //!
-//! `tvm-ffi` types (Module/Function/Tensor) are not Send/Sync and the VM is
-//! not thread-safe. Each worker loads its OWN copy of the model on its own
-//! thread and never crosses threads; axum sends jobs over a shared channel
-//! carrying only Send data (Vec<f32> + shape). N workers (`TVM_SERVE_WORKERS`)
-//! drain the same queue, so up to N inferences run concurrently at the cost of
-//! N model copies in memory.
+//! `tvm-ffi` types aren't Send/Sync and the VM isn't thread-safe, so each worker
+//! owns its own model copy on its own thread; jobs cross threads carrying only
+//! Send data. N workers drain one queue: N concurrent inferences, N model copies.
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -27,13 +24,10 @@ pub struct InferOutput {
     pub data: TensorData,
 }
 
-// A queued job: the input tensors plus the one-shot channel to answer on. A plain
-// tuple, not an enum, since there is only ever one kind of job.
 type Reply = oneshot::Sender<Result<Vec<InferOutput>, String>>;
 type Job = (Vec<InferInput>, Reply);
 
-// Coarse error kind so the REST and gRPC handlers can each map a validation or
-// inference failure to their own status type from one shared path (`serve_infer`).
+// Coarse error kind so REST and gRPC each map to their own status from `serve_infer`.
 pub enum ServeErr {
     NotFound(String),
     BadRequest(String),
@@ -47,8 +41,8 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Validate a v2 request against the model signature, then run it. The single
-    /// path both transports share — they only differ in wire decoding/encoding.
+    /// Validate a v2 request against the model signature, then run it. The one
+    /// path both transports share; they differ only in wire decoding/encoding.
     pub async fn serve_infer(
         &self,
         name: &str,
@@ -67,9 +61,8 @@ impl Handle {
                 inputs.len()
             )));
         }
-        // Match by name when we can: the v2 spec identifies tensors by name, so if
-        // every input is named and the set matches the model's input names exactly,
-        // reorder to metadata order. Otherwise fall back to positional matching.
+        // When every input is named and the name set matches exactly, reorder to
+        // metadata order; otherwise fall back to positional matching.
         let meta_names: Vec<&str> = self.metadata.inputs.iter().map(|t| t.name.as_str()).collect();
         let mut inputs = inputs;
         let names_match = !meta_names.is_empty() && inputs.iter().all(|i| !i.name.is_empty()) && {
@@ -105,9 +98,7 @@ impl Handle {
 /// the model so `ready` is real. `workers` is clamped to at least 1.
 pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Result<Handle> {
     let meta = Metadata::from_file(&format!("{model_dir}/metadata.json"))?;
-    // Fail fast at startup for a model whose declared dtypes this image can't
-    // serve, rather than erroring on every request. Native dtypes are supported;
-    // FP16 (and bool) are deferred.
+    // Fail fast at startup on an unservable dtype rather than per-request; FP16/bool deferred.
     const SUPPORTED: &[&str] = &[
         "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32",
         "uint64",
@@ -125,11 +116,9 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
     let so_path = format!("{model_dir}/model.so");
     let workers = workers.max(1);
 
-    // One shared job queue drained by N worker threads (multi-consumer via a Mutex
-    // around the single-consumer receiver). A worker holds the lock only to dequeue,
-    // then releases it before running inference, so up to N jobs run concurrently.
-    // The std-sync channel reports each worker's model-load outcome so `start` can
-    // block until the whole pool is warm.
+    // One job queue, N consumers via a Mutex around the receiver (held only to
+    // dequeue). A std-sync channel reports each worker's load outcome so `start`
+    // can block until the pool is warm.
     let (tx, rx) = mpsc::channel::<Job>(64);
     let rx = Arc::new(Mutex::new(rx));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -154,8 +143,7 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
                     }
                 };
                 loop {
-                    // Hold the receiver lock only to dequeue, then drop it so a
-                    // sibling worker can take the next job while this one runs.
+                    // Hold the lock only to dequeue, then drop it so a sibling can run.
                     let job = {
                         let mut guard = rx.blocking_lock();
                         guard.blocking_recv()
@@ -171,7 +159,7 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
     }
     drop(ready_tx); // only the worker threads keep senders now
 
-    // Block until every worker has loaded its model (or one failed to).
+    // Block until every worker has loaded its model (or one failed).
     for _ in 0..workers {
         ready_rx
             .recv()
@@ -191,8 +179,7 @@ fn run_one(
     inputs: &[InferInput],
     outputs_meta: &[TensorSpec],
 ) -> Result<Vec<InferOutput>, String> {
-    // Re-validate the shape (defense in depth; the handlers validate too) so a
-    // malformed shape can't reach tensor construction and crash the worker thread.
+    // Re-validate the shape (defense in depth) so a bad shape can't crash tensor construction.
     let mut tensors = Vec::with_capacity(inputs.len());
     for (i, inp) in inputs.iter().enumerate() {
         crate::protocol::validate_shape(i, &inp.shape, inp.data.len())?;
@@ -203,8 +190,7 @@ fn run_one(
 
     let mut result = Vec::with_capacity(outs.len());
     for (i, t) in outs.iter().enumerate() {
-        // The output dtype comes from the tensor itself (authoritative), not the
-        // metadata, so a model that returns e.g. int64 indices reports INT64.
+        // Output dtype comes from the tensor, not metadata (so int64 indices report INT64).
         let (data, datatype) = read_tensor(t)?;
         let name = outputs_meta
             .get(i)
@@ -220,8 +206,7 @@ fn run_one(
     Ok(result)
 }
 
-// Build a CPU TVM tensor from typed data, dispatching on the variant so each
-// element type maps to its DLDataType via `from_slice`.
+// Build a CPU TVM tensor from typed data, dispatching on the variant.
 fn build_tensor(data: &TensorData, shape: &[i64]) -> Result<Tensor, String> {
     let r = match data {
         TensorData::F32(v) => Tensor::from_slice(v, shape),
@@ -238,9 +223,8 @@ fn build_tensor(data: &TensorData, shape: &[i64]) -> Result<Tensor, String> {
     r.map_err(|e| format!("Tensor::from_slice: {e:?}"))
 }
 
-// Read a TVM output tensor into typed data plus its v2 datatype string,
-// dispatching on the tensor's actual DLDataType (code, bits). data_as_slice::<T>
-// is safe here because T is chosen to match that dtype.
+// Read an output tensor into typed data + its v2 datatype, dispatching on the
+// actual DLDataType. data_as_slice::<T> is safe because T matches that dtype.
 fn read_tensor(t: &Tensor) -> Result<(TensorData, &'static str), String> {
     let dt = t.dtype();
     let (code, bits) = (dt.code, dt.bits);
