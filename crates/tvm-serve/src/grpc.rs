@@ -120,7 +120,6 @@ impl GrpcInferenceService for InferenceService {
                 .map_err(|e| Status::invalid_argument(format!("input[{i}]: {e}")))?;
             inputs.push(InferInput {
                 name: t.name.clone(),
-                datatype: t.datatype.clone(),
                 shape: t.shape.clone(),
                 data,
             });

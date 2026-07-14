@@ -3,7 +3,7 @@
 //! Config via env:
 //! ```text
 //! TVM_MODEL_DIR        model.so + metadata.json (default /shared/model)
-//! TVM_MODEL_NAME       model name in /v2/models/<name> (default tvm-model)
+//! TVM_MODEL_NAME       model name in /v2/models/<name> (default model)
 //! TVM_SERVE_PORT       REST port (default 8080)
 //! TVM_SERVE_GRPC_PORT  gRPC port (default 9000)
 //! TVM_SERVE_WORKERS    inference workers / model copies (default 1)
@@ -37,7 +37,7 @@ struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let model_dir = std::env::var("TVM_MODEL_DIR").unwrap_or_else(|_| "/shared/model".to_string());
-    let model_name = std::env::var("TVM_MODEL_NAME").unwrap_or_else(|_| "tvm-model".to_string());
+    let model_name = std::env::var("TVM_MODEL_NAME").unwrap_or_else(|_| "model".to_string());
     let port = env_u16("TVM_SERVE_PORT", 8080);
     let grpc_port = env_u16("TVM_SERVE_GRPC_PORT", 9000);
     let workers = env_usize("TVM_SERVE_WORKERS", 1);
@@ -205,7 +205,6 @@ async fn do_infer(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         inputs.push(InferInput {
             name: i.name,
-            datatype: i.datatype,
             shape: i.shape,
             data,
         });

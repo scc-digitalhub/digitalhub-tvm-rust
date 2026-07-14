@@ -16,7 +16,6 @@ use crate::protocol::TensorData;
 
 pub struct InferInput {
     pub name: String,
-    pub datatype: String,
     pub shape: Vec<i64>,
     pub data: TensorData,
 }
@@ -84,7 +83,7 @@ impl Handle {
             inputs.sort_by_key(|i| meta_names.iter().position(|n| *n == i.name).unwrap_or(usize::MAX));
         }
         for (idx, i) in inputs.iter().enumerate() {
-            crate::protocol::validate_input(idx, &i.datatype, &i.shape, i.data.len())
+            crate::protocol::validate_shape(idx, &i.shape, i.data.len())
                 .map_err(ServeErr::BadRequest)?;
         }
         self.infer(inputs).await.map_err(ServeErr::Internal)

@@ -210,39 +210,6 @@ pub fn validate_shape(idx: usize, shape: &[i64], data_len: usize) -> Result<(), 
     Ok(())
 }
 
-/// The native v2 datatypes this serve image supports (FP16 and BOOL excluded).
-pub fn is_supported_v2_dtype(dt: &str) -> bool {
-    matches!(
-        dt,
-        "FP32"
-            | "FP64"
-            | "INT8"
-            | "INT16"
-            | "INT32"
-            | "INT64"
-            | "UINT8"
-            | "UINT16"
-            | "UINT32"
-            | "UINT64"
-    )
-}
-
-/// Validates one input tensor: a supported native datatype plus `validate_shape`.
-/// Returns a human-readable error for a 400 / invalid_argument response.
-pub fn validate_input(
-    idx: usize,
-    datatype: &str,
-    shape: &[i64],
-    data_len: usize,
-) -> Result<(), String> {
-    if !is_supported_v2_dtype(datatype) {
-        return Err(format!(
-            "input[{idx}]: datatype '{datatype}' unsupported (FP16/BOOL are not served)"
-        ));
-    }
-    validate_shape(idx, shape, data_len)
-}
-
 /// TVM dtype (e.g. `"float32"`) → Open Inference v2 datatype (e.g. `"FP32"`).
 pub fn tvm_to_v2_dtype(dt: &str) -> &'static str {
     match dt {

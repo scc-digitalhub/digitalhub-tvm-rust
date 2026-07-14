@@ -59,8 +59,8 @@ single worker inferences are serialized — one at a time.
 
 | Crate | Path | Role |
 |-------|------|------|
-| `tvm-relax` | `crates/tvm-relax` | The `RelaxModel` inference library. Loads `model.so` and drives the Relax VirtualMachine through raw `PackedFunc` calls over the `tvm-ffi` C ABI. `src/lib.rs` is the core; `build.rs` force-links `libtvm_runtime`. |
-| `tvm-serve` | `crates/tvm-serve` | The server binary. `main.rs` reads env config, spins up the worker pool (each thread loads its own model copy), starts REST + gRPC. `worker.rs` is the pool of model-owning threads + the shared inference queue. `protocol.rs` has the REST OpenInference v2 handlers and the v2 JSON structs. `grpc.rs` implements the gRPC `GRPCInferenceService`. `build.rs` compiles the proto and repeats the native link setup. |
+| `tvm-relax` | `crates/tvm-relax` | The `RelaxModel` inference library. Loads `model.so` and drives the Relax VirtualMachine through raw `PackedFunc` calls over the `tvm-ffi` C ABI. `src/lib.rs` is the core. |
+| `tvm-serve` | `crates/tvm-serve` | The server binary. `main.rs` reads env config, spins up the worker pool (each thread loads its own model copy), starts REST + gRPC. `worker.rs` is the pool of model-owning threads + the shared inference queue. `protocol.rs` has the REST OpenInference v2 handlers and the v2 JSON structs. `grpc.rs` implements the gRPC `GRPCInferenceService`. `build.rs` compiles the proto and does the native link setup (force-links `libtvm_runtime`). |
 
 ### The crux: driving the Relax VM from Rust
 
@@ -82,10 +82,10 @@ A single Relax output Tensor or an output tuple (`Array<Tensor>`) is normalized 
 **Why `build.rs` force-links `libtvm_runtime` (`--no-as-needed`):** the runtime
 `.so` registers the `relax.VMExecutable` loader through a static initializer. The
 binary never references its symbols directly, so the default `--as-needed` linker
-behavior would drop it and the VM loader would not be registered at runtime. Both
-`build.rs` files wrap `-ltvm_runtime` in `--no-as-needed` / `--as-needed` and add
-an rpath. (`cargo:rustc-link-arg` does not propagate from a dependency to the
-binary crate, so the setup is duplicated in `tvm-serve/build.rs`.)
+behavior would drop it and the VM loader would not be registered at runtime.
+`tvm-serve/build.rs` wraps `-ltvm_runtime` in `--no-as-needed` / `--as-needed` and
+adds an rpath. (`cargo:rustc-link-arg` does not propagate from a dependency to the
+binary crate, so the setup lives in the binary crate's `build.rs`.)
 
 ## Building the image
 
@@ -112,7 +112,7 @@ It requires a **locally-built TVM** — the script copies `libtvm_runtime.so` an
 The Rust build itself resolves the TVM libs two ways: `build.rs` reads
 `TVM_BUILD_DIR` (`build-image.sh` sets it to `$TVM_BUILD`), and `tvm-ffi-sys`'s
 build invokes `tvm-ffi-config` — a shim in `scripts/tvm-ffi-config` (put it on
-`PATH`, override with `TVM_FFI_LIBDIR` / `TVM_FFI_INCLUDEDIR`). The `tvm-ffi` Rust
+`PATH`, override with `TVM_FFI_LIBDIR`). The `tvm-ffi` Rust
 bindings are the ones bundled with the active TVM version and must be ABI-coherent
 with the `.so`s being linked.
 
@@ -148,7 +148,7 @@ per-run via `task.image`.
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `TVM_MODEL_DIR` | `/shared/model` (image: `/model`) | Dir holding `model.so` + `metadata.json` |
-| `TVM_MODEL_NAME` | `tvm-model` | Name in `/v2/models/<name>` |
+| `TVM_MODEL_NAME` | `model` | Name in `/v2/models/<name>` |
 | `TVM_SERVE_PORT` | `8080` | REST port |
 | `TVM_SERVE_GRPC_PORT` | `9000` | gRPC port |
 | `TVM_SERVE_WORKERS` | `1` | Worker threads in the pool (each loads its own model copy); up to N concurrent inferences. Wired from the `tvm+serve` spec field `task.workers`. |

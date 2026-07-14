@@ -14,12 +14,6 @@
 # GLIBC_2.38 + GLIBCXX_3.4.32 -> ubuntu:24.04 (glibc 2.39, libstdc++13).
 FROM ubuntu:24.04
 
-# The only system deps are glibc + libstdc++ (explicit for safety); no
-# LLVM/OpenMP in the runtime.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libstdc++6 \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY lib/libtvm_runtime.so lib/libtvm_ffi.so /opt/tvm/lib/
 COPY tvm-serve /usr/local/bin/tvm-serve
 
