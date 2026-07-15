@@ -48,6 +48,21 @@ impl Handle {
         name: &str,
         inputs: Vec<InferInput>,
     ) -> Result<Vec<InferOutput>, ServeErr> {
+        let desc: Vec<String> = inputs.iter().map(|i| format!("{}:{:?}", i.name, i.shape)).collect();
+        eprintln!("[tvm-serve] infer req model={name} inputs=[{}]", desc.join(", "));
+        let result = self.serve_infer_inner(name, inputs).await;
+        // Validation rejections are only visible here; runtime errors are logged by the worker thread.
+        if let Err(ServeErr::NotFound(m) | ServeErr::BadRequest(m)) = &result {
+            eprintln!("[tvm-serve] infer rejected model={name}: {m}");
+        }
+        result
+    }
+
+    async fn serve_infer_inner(
+        &self,
+        name: &str,
+        inputs: Vec<InferInput>,
+    ) -> Result<Vec<InferOutput>, ServeErr> {
         if name != self.model_name {
             return Err(ServeErr::NotFound(format!("model '{name}' not found")));
         }
@@ -79,8 +94,6 @@ impl Handle {
             crate::protocol::validate_shape(idx, &i.shape, i.data.len())
                 .map_err(ServeErr::BadRequest)?;
         }
-        let desc: Vec<String> = inputs.iter().map(|i| format!("{}:{:?}", i.name, i.shape)).collect();
-        eprintln!("[tvm-serve] infer req model={name} inputs=[{}]", desc.join(", "));
         self.infer(inputs).await.map_err(ServeErr::Internal)
     }
 
