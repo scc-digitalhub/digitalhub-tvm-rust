@@ -79,6 +79,8 @@ impl Handle {
             crate::protocol::validate_shape(idx, &i.shape, i.data.len())
                 .map_err(ServeErr::BadRequest)?;
         }
+        let desc: Vec<String> = inputs.iter().map(|i| format!("{}:{:?}", i.name, i.shape)).collect();
+        eprintln!("[tvm-serve] infer req model={name} inputs=[{}]", desc.join(", "));
         self.infer(inputs).await.map_err(ServeErr::Internal)
     }
 
@@ -150,7 +152,23 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
                     };
                     match job {
                         Some((inputs, reply)) => {
-                            let _ = reply.send(run_one(&model, &inputs, &outputs_meta));
+                            let started = std::time::Instant::now();
+                            let result = run_one(&model, &inputs, &outputs_meta);
+                            match &result {
+                                Ok(outs) => {
+                                    let shapes: Vec<String> = outs
+                                        .iter()
+                                        .map(|o| format!("{}:{:?} {}", o.name, o.shape, o.datatype))
+                                        .collect();
+                                    eprintln!(
+                                        "[tvm-serve] infer done worker={w} run={}ms outputs=[{}]",
+                                        started.elapsed().as_millis(),
+                                        shapes.join(", ")
+                                    );
+                                }
+                                Err(e) => eprintln!("[tvm-serve] infer error worker={w}: {e}"),
+                            }
+                            let _ = reply.send(result);
                         }
                         None => break,
                     }
