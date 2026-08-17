@@ -56,6 +56,16 @@ pub struct TensorSpec {
     pub shape: Vec<i64>,
     #[serde(default = "default_dtype")]
     pub dtype: String,
+    /// Affine quantization params, present only for quantized models (TFLite int8).
+    /// A client receiving int8 cannot map the values back to reals without them, so
+    /// they travel with the model. Per-axis quantization yields more than one entry,
+    /// indexed by `quantized_dimension`.
+    #[serde(default)]
+    pub scale: Vec<f64>,
+    #[serde(default)]
+    pub zero_point: Vec<i64>,
+    #[serde(default)]
+    pub quantized_dimension: Option<i64>,
 }
 
 /// The `metadata.json` sidecar emitted alongside `model.so`: it names the VM
@@ -134,5 +144,63 @@ impl RelaxModel {
             tensors.push(ffi(arr.get(i))?);
         }
         Ok(tensors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// metadata.json carries the affine params of a quantized model, and serde must
+    /// keep them: an unknown field would be dropped silently, leaving a client unable
+    /// to interpret the int8 it receives.
+    #[test]
+    fn metadata_parses_quantization_params() {
+        let raw = r#"{
+            "entry": "main",
+            "inputs":  [{"name":"images","shape":[1,224,224,3],"dtype":"int8",
+                         "scale":[0.003921568859368563],"zero_point":[-128]}],
+            "outputs": [{"name":"out","shape":[1,56,1029],"dtype":"int8",
+                         "scale":[0.0172492116689682],"zero_point":[-35]}]
+        }"#;
+        let m: Metadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.inputs[0].scale, vec![0.003921568859368563]);
+        assert_eq!(m.inputs[0].zero_point, vec![-128]);
+        assert_eq!(m.outputs[0].zero_point, vec![-35]);
+    }
+
+    /// Per-axis quantization indexes the entries by an axis, which must survive too.
+    #[test]
+    fn metadata_parses_per_axis_quantization() {
+        let raw = r#"{"entry":"main",
+            "inputs":[{"name":"w","shape":[64,3,3,3],"dtype":"int8",
+                       "scale":[0.1,0.2],"zero_point":[0,0],"quantized_dimension":3}],
+            "outputs":[]}"#;
+        let m: Metadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.inputs[0].scale.len(), 2);
+        assert_eq!(m.inputs[0].quantized_dimension, Some(3));
+    }
+
+    /// A float model has no params: the vectors stay empty rather than zeroed, and it
+    /// is that emptiness that tells "not quantized" from "quantized with scale 0".
+    /// Also the non-regression on the old metadata.json, which had no such fields.
+    #[test]
+    fn metadata_float_model_has_no_quantization_params() {
+        let raw = r#"{"entry":"main",
+            "inputs":[{"name":"images","shape":[1,3,640,640],"dtype":"float32"}],
+            "outputs":[{"name":"out","shape":[1,84,8400],"dtype":"float32"}]}"#;
+        let m: Metadata = serde_json::from_str(raw).unwrap();
+        assert!(m.inputs[0].scale.is_empty());
+        assert!(m.inputs[0].zero_point.is_empty());
+        assert_eq!(m.inputs[0].quantized_dimension, None);
+        assert_eq!(m.outputs[0].dtype, "float32");
+    }
+
+    /// dtype keeps defaulting to float32 when metadata.json omits it.
+    #[test]
+    fn metadata_dtype_defaults_to_float32() {
+        let raw = r#"{"entry":"main","inputs":[{"name":"x","shape":[1]}],"outputs":[]}"#;
+        let m: Metadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.inputs[0].dtype, "float32");
     }
 }

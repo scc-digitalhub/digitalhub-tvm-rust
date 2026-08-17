@@ -135,10 +135,22 @@ async fn server_metadata() -> Json<ServerMetadata> {
 }
 
 fn to_tensor_metadata(s: &tvm_relax::TensorSpec) -> TensorMetadata {
+    // Quantized models only: surface scale/zero_point so the client can do the affine
+    // mapping. Float models keep `parameters` absent (skip_serializing_if).
+    let parameters = if s.scale.is_empty() {
+        None
+    } else {
+        let mut p = serde_json::json!({ "scale": s.scale, "zero_point": s.zero_point });
+        if let Some(d) = s.quantized_dimension {
+            p["quantized_dimension"] = serde_json::json!(d);
+        }
+        Some(p)
+    };
     TensorMetadata {
         name: s.name.clone(),
         datatype: tvm_to_v2_dtype(&s.dtype).to_string(),
         shape: s.shape.clone(),
+        parameters,
     }
 }
 
@@ -232,5 +244,55 @@ fn serve_err_http(e: ServeErr) -> (StatusCode, String) {
         ServeErr::NotFound(m) => (StatusCode::NOT_FOUND, m),
         ServeErr::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
         ServeErr::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(dtype: &str, scale: Vec<f64>, zero_point: Vec<i64>) -> tvm_relax::TensorSpec {
+        tvm_relax::TensorSpec {
+            name: "images".to_string(),
+            shape: vec![1, 224, 224, 3],
+            dtype: dtype.to_string(),
+            scale,
+            zero_point,
+            quantized_dimension: None,
+        }
+    }
+
+    /// A quantized tensor publishes scale/zero_point under the v2 `parameters` map:
+    /// it is the only way a client can turn the int8 it receives back into reals.
+    #[test]
+    fn quantized_tensor_publishes_parameters() {
+        let m = to_tensor_metadata(&spec("int8", vec![0.003921568859368563], vec![-128]));
+        assert_eq!(m.datatype, "INT8");
+        let p = m.parameters.expect("un tensore quantizzato deve esporre i parametri");
+        assert_eq!(p["scale"][0], 0.003921568859368563);
+        assert_eq!(p["zero_point"][0], -128);
+        assert!(p.get("quantized_dimension").is_none(), "per-tensore: nessun asse");
+    }
+
+    /// Per-axis quantization also carries the axis the entries are indexed by.
+    #[test]
+    fn per_axis_tensor_publishes_quantized_dimension() {
+        let mut s = spec("int8", vec![0.1, 0.2], vec![0, 0]);
+        s.quantized_dimension = Some(3);
+        let p = to_tensor_metadata(&s).parameters.unwrap();
+        assert_eq!(p["quantized_dimension"], 3);
+    }
+
+    /// Non-regression: a float model must serialize exactly as before. `parameters`
+    /// has to disappear from the JSON, not show up as null — quantization is an
+    /// independent axis and must not leak into models that have none.
+    #[test]
+    fn float_tensor_omits_parameters() {
+        let m = to_tensor_metadata(&spec("float32", vec![], vec![]));
+        assert_eq!(m.datatype, "FP32");
+        assert!(m.parameters.is_none());
+
+        let raw = serde_json::to_string(&m).unwrap();
+        assert!(!raw.contains("parameters"), "JSON inatteso: {raw}");
     }
 }

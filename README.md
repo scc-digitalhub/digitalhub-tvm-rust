@@ -166,6 +166,24 @@ REST (axum) and gRPC (`inference.GRPCInferenceService`) expose the same v2 surfa
 | Model metadata | `GET /v2/models/:name` | `ModelMetadata` |
 | Infer | `POST /v2/models/:name/infer` (and `/versions/:version/infer`) | `ModelInfer` |
 
+### Quantized models
+
+For a model whose boundary tensors are `int8`/`uint8` (a TFLite full-integer export, a
+QDQ ONNX), `GET /v2/models/:name` adds the affine params under the v2 `parameters` map,
+read from `metadata.json`:
+
+```json
+{ "name": "images", "datatype": "INT8", "shape": [1, 224, 224, 3],
+  "parameters": { "scale": [0.003921568859368563], "zero_point": [-128] } }
+```
+
+They are what lets a client quantize its input and dequantize the output —
+`real = (q - zero_point) * scale`. Per-axis quantization yields more than one entry plus
+a `quantized_dimension`. The server never uses them for inference (TVM baked the
+quantization into `model.so`); it only forwards them. **Float models keep `parameters`
+absent entirely**, so their response is unchanged. Note the gRPC `ModelMetadata` does
+not carry them: the generated v2 proto has no `parameters` field on `TensorMetadata`.
+
 Inputs are matched **positionally** (client sends tensors in `metadata.inputs`
 order). Input `datatype` may be any of the supported native dtypes — `FP32`,
 `FP64`, `INT8`/`INT16`/`INT32`/`INT64`, `UINT8`/`UINT16`/`UINT32`/`UINT64`; `FP16`

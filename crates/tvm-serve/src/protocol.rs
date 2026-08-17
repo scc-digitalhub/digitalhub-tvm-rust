@@ -163,6 +163,11 @@ pub struct TensorMetadata {
     pub name: String,
     pub datatype: String,
     pub shape: Vec<i64>,
+    /// Quantization params for int8/uint8 models, in the v2 `parameters` map so a
+    /// client can quantize its input and dequantize the output. Omitted for float
+    /// models, which keeps the response byte-identical to before for those.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
