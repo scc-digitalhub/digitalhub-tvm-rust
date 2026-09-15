@@ -22,6 +22,8 @@ permissions:
 env:
   IMAGE: ghcr.io/scc-digitalhub/tvm-runtime-rust
   TOOLKIT_IMAGE: ghcr.io/scc-digitalhub/tvm-toolkit
+  # shown by GitHub Packages; source links the package to this repository
+  DESCRIPTION: "Rust OpenInference v2 server (REST and gRPC) for TVM-compiled models, used by DigitalHub tvm+serve"
 
 defaults:
   run:
@@ -183,6 +185,8 @@ jobs:
             --build-arg "TVM_GIT_COMMIT=$TVM_GIT_COMMIT" \
             --build-arg "TVM_FFI_VERSION=$TVM_FFI_VERSION" \
             --build-arg "TVM_FFI_GIT_COMMIT=$TVM_FFI_GIT_COMMIT" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.description=$DESCRIPTION" \
             .
           arch="$(docker image inspect -f '{{.Architecture}}' "$REF")"
           if [ "$arch" != "${{ matrix.arch }}" ]; then
@@ -220,7 +224,10 @@ jobs:
 
       - name: Publish the multi-arch tag
         run: |
-          docker buildx imagetools create -t "$IMAGE:$TAG" "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+          docker buildx imagetools create -t "$IMAGE:$TAG" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
           docker buildx imagetools inspect --raw "$IMAGE:$TAG" > index.json
           python3 - index.json <<'PY'
           import json
