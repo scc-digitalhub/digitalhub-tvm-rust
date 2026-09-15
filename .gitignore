@@ -1,6 +1,8 @@
 /target
+/.tvm-ffi-rust
 # locally generated reference artifacts (not versioned)
 **/*.bin
 # artifacts staged into the Docker build context by build-image.sh (not versioned)
 /lib/
 /tvm-serve
+/provenance.json

@@ -17,11 +17,9 @@ license = "Apache-2.0"
 rust-version = "1.80"
 
 [workspace.dependencies]
-# tvm-ffi (the Rust bindings) must be ABI-coherent with the libtvm_ffi.so we
-# link against. The path points at the `tvm-current` symlink naming the active
-# TVM version; create/update it by hand with:
-#   ln -sfn tvm-0.25.0 ~/tvm/src/tvm-current
-tvm-ffi = { path = "/home/ltrubbiani/tvm/src/tvm-current/3rdparty/tvm-ffi/rust/tvm-ffi" }
+# build-image.sh points this ignored local link at the verified tvm-ffi
+# submodule belonging to the same TVM build as the packaged native libraries.
+tvm-ffi = { path = ".tvm-ffi-rust/tvm-ffi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

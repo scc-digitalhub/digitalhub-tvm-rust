@@ -1,0 +1,180 @@
+# Builds ghcr.io/scc-digitalhub/tvm-runtime-rust:<X.Y> when a tag X.Y is pushed:
+# compiles tvm-serve against the TVM libraries of ghcr.io/scc-digitalhub/tvm-toolkit:<X.Y>
+# (which must be published, and public, first) and packages them together, so every
+# TVM image shares the same binaries.
+name: tvm-runtime-rust image
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/scc-digitalhub/tvm-runtime-rust
+  TOOLKIT_IMAGE: ghcr.io/scc-digitalhub/tvm-toolkit
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Resolve version from the tag
+        id: v
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::run on a tag X.Y, got '$GITHUB_REF_NAME'"
+            exit 1
+          fi
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Take TVM from tvm-toolkit
+        run: |
+          toolkit="$TOOLKIT_IMAGE:${{ steps.v.outputs.tag }}"
+          docker pull "$toolkit"
+          label() { docker inspect -f "{{ index .Config.Labels \"$1\" }}" "$toolkit"; }
+          version="$(label org.opencontainers.image.version)"
+          revision="$(label org.opencontainers.image.revision)"
+          ffi_version="$(label org.digitalhub.tvm-ffi.version)"
+          ffi_revision="$(label org.digitalhub.tvm-ffi.revision)"
+          for value in "$version" "$revision" "$ffi_version" "$ffi_revision"; do
+            if [ -z "$value" ] || [ "$value" = "<no value>" ]; then
+              echo "::error::$toolkit has no TVM version labels: rebuild it with the digitalhub-tvm-toolkit workflow"
+              exit 1
+            fi
+          done
+          tvm_build="$RUNNER_TEMP/tvm-build"
+          mkdir -p "$tvm_build/lib"
+          cid="$(docker create "$toolkit")"
+          docker cp "$cid:/opt/tvm/lib/libtvm_runtime.so" "$tvm_build/lib/"
+          docker cp "$cid:/opt/tvm/lib/libtvm_ffi.so" "$tvm_build/lib/"
+          docker rm "$cid"
+          # tvm-ffi-sys also links -ltvm_ffi_testing, which the toolkit image does not ship:
+          # an empty stub satisfies the linker and --as-needed keeps it out of tvm-serve
+          # (checked right after the build)
+          cc -shared -x c /dev/null -o "$tvm_build/lib/libtvm_ffi_testing.so"
+          # the Rust tvm-ffi crates from the exact TVM / tvm-ffi commits of the libraries
+          git clone --depth 1 --branch "v$version" https://github.com/apache/tvm "$RUNNER_TEMP/tvm"
+          git -C "$RUNNER_TEMP/tvm" submodule update --init --depth 1 3rdparty/tvm-ffi
+          if [ "$(git -C "$RUNNER_TEMP/tvm" rev-parse HEAD)" != "$revision" ] \
+            || [ "$(git -C "$RUNNER_TEMP/tvm/3rdparty/tvm-ffi" rev-parse HEAD)" != "$ffi_revision" ]; then
+            echo "::error::apache/tvm v$version does not match the commits $toolkit was built from"
+            exit 1
+          fi
+          {
+            echo "TVM_VERSION=$version"
+            echo "TVM_GIT_COMMIT=$revision"
+            echo "TVM_FFI_VERSION=$ffi_version"
+            echo "TVM_FFI_GIT_COMMIT=$ffi_revision"
+            echo "TVM_SRC=$RUNNER_TEMP/tvm"
+            echo "TVM_BUILD=$tvm_build"
+          } >> "$GITHUB_ENV"
+
+      - name: Build tvm-serve
+        run: |
+          chmod +x scripts/tvm-ffi-config
+          ln -sfn "$TVM_SRC/3rdparty/tvm-ffi/rust" .tvm-ffi-rust
+          cargo --version
+          PATH="$GITHUB_WORKSPACE/scripts:$PATH" \
+            TVM_BUILD_DIR="$TVM_BUILD" \
+            TVM_FFI_LIBDIR="$TVM_BUILD/lib" \
+            cargo build --locked --release --bin tvm-serve
+          needed="$(readelf -d target/release/tvm-serve)"
+          for library in libtvm_ffi.so libtvm_runtime.so; do
+            if ! grep -F "Shared library: [$library]" <<<"$needed" >/dev/null; then
+              echo "::error::tvm-serve is not linked to $library"
+              exit 1
+            fi
+          done
+          if grep -F "libtvm_ffi_testing" <<<"$needed"; then
+            echo "::error::tvm-serve needs libtvm_ffi_testing.so, which the image does not ship"
+            exit 1
+          fi
+
+      - name: Stage the image build context
+        env:
+          IMAGE_TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          # same layout build-image.sh produces: lib/, tvm-serve and provenance.json at the root
+          rm -rf lib tvm-serve provenance.json .tvm-ffi-rust
+          mkdir -p lib
+          cp "$TVM_BUILD/lib/libtvm_runtime.so" "$TVM_BUILD/lib/libtvm_ffi.so" lib/
+          cp target/release/tvm-serve tvm-serve
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          run_url = "{}/{}/actions/runs/{}".format(
+              os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]
+          )
+          manifest = {
+              "schema_version": 1,
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "tvm_version": os.environ["TVM_VERSION"],
+              "tvm_git_commit": os.environ["TVM_GIT_COMMIT"],
+              "tvm_ffi_version": os.environ["TVM_FFI_VERSION"],
+              "tvm_ffi_git_commit": os.environ["TVM_FFI_GIT_COMMIT"],
+              "libraries_from": "{}:{}".format(os.environ["TOOLKIT_IMAGE"], os.environ["IMAGE_TAG"]),
+              "build_run": run_url,
+              "libraries": {
+                  lib.name: hashlib.sha256(lib.read_bytes()).hexdigest()
+                  for lib in sorted(Path("lib").glob("*.so"))
+              },
+          }
+          Path("provenance.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Build image
+        run: |
+          ref="$IMAGE:${{ steps.v.outputs.tag }}"
+          docker build -t "$ref" \
+            --build-arg "TVM_VERSION=$TVM_VERSION" \
+            --build-arg "TVM_GIT_COMMIT=$TVM_GIT_COMMIT" \
+            --build-arg "TVM_FFI_VERSION=$TVM_FFI_VERSION" \
+            --build-arg "TVM_FFI_GIT_COMMIT=$TVM_FFI_GIT_COMMIT" \
+            .
+          for library in libtvm_runtime.so libtvm_ffi.so; do
+            want="$(sha256sum "lib/$library" | cut -d' ' -f1)"
+            got="$(docker run --rm --entrypoint /usr/bin/sha256sum "$ref" "/opt/tvm/lib/$library" | cut -d' ' -f1)"
+            if [ "$want" != "$got" ]; then
+              echo "::error::$library in $ref differs from the one taken from tvm-toolkit"
+              exit 1
+            fi
+          done
+          # every shared library tvm-serve needs must resolve inside the image
+          docker run --rm --entrypoint /bin/sh "$ref" -c '! ldd /usr/local/bin/tvm-serve | grep "not found"'
+
+      - name: Push image
+        run: |
+          ref="$IMAGE:${{ steps.v.outputs.tag }}"
+          docker push "$ref"
+          {
+            echo "### Published \`$ref\`"
+            echo "TVM $TVM_VERSION ($TVM_GIT_COMMIT), libraries from \`$TOOLKIT_IMAGE:${{ steps.v.outputs.tag }}\`"
+            echo ""
+            echo "On the first publish make the package public: organization → Packages → tvm-runtime-rust → Package settings."
+          } >> "$GITHUB_STEP_SUMMARY"
