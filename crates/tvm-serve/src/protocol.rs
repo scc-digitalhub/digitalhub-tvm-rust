@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Open Inference v2 (KServe) protocol types, REST/JSON subset. Tensor `data` is
 //! carried as [`TensorData`] over the native dtypes this image supports; FP16/BOOL
 //! are unsupported.

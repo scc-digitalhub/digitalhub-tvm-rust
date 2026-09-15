@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Open Inference v2 (KServe) gRPC service. Shares model and worker with the
 //! REST side via `Arc<Handle>`; default port 9000.
 use std::sync::Arc;

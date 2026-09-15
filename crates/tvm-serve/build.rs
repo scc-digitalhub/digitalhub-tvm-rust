@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Native linking for the tvm-serve binary. tvm-ffi-sys links libtvm_ffi.so; the
 //! Relax VM lives in libtvm_runtime.so, linked below. `cargo:rustc-link-arg` does
 //! NOT propagate from dependency rlibs (e.g. tvm-relax), so the link setup lives here.

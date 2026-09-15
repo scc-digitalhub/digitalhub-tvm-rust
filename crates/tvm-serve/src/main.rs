@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Open Inference v2 (KServe) server for TVM Relax models, REST + gRPC.
 //!
 //! Config via env:

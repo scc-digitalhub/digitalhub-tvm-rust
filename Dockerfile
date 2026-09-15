@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Model-agnostic TVM serving image (tvm-runtime-rust): runtime .so + tvm-serve
 # binary only. A model (model.so + metadata.json) is injected into TVM_MODEL_DIR
 # at deploy time; serves OpenInference v2 (REST 8080 / gRPC 9000).

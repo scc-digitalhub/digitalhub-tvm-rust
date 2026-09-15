@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Shim `tvm-ffi-config` (non prodotto da cmake): tvm-ffi-sys/build.rs lo invoca
 # per trovare libtvm_ffi.so. Metterlo su PATH quando si compila; override TVM_FFI_LIBDIR.
 LIBDIR="${TVM_FFI_LIBDIR:-/home/ltrubbiani/tvm/src/tvm-current/build/lib}"

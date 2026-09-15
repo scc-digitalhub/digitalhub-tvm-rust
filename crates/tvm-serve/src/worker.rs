@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: © 2025 DSLab - Fondazione Bruno Kessler
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Inference worker pool on dedicated OS threads.
 //!
 //! `tvm-ffi` types aren't Send/Sync and the VM isn't thread-safe, so each worker
