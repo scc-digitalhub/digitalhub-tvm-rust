@@ -1,13 +1,15 @@
-# Builds ghcr.io/scc-digitalhub/tvm-runtime-rust:<X.Y> when a tag X.Y is pushed:
-# compiles tvm-serve against the TVM libraries of ghcr.io/scc-digitalhub/tvm-toolkit:<X.Y>
-# (which must be published, and public, first) and packages them together, so every
-# TVM image shares the same binaries.
+# Builds the multi-arch image ghcr.io/scc-digitalhub/tvm-runtime-rust:<X.Y> (linux/amd64
+# and linux/arm64) when a tag X.Y or X.Y.Z is pushed. Each architecture compiles tvm-serve
+# natively against the TVM libraries of the same variant of
+# ghcr.io/scc-digitalhub/tvm-toolkit:<X.Y> (which must be published, and public, first)
+# and pushes <X.Y>-<arch>; the manifest job then publishes <X.Y>.
 name: tvm-runtime-rust image
 
 on:
   push:
     tags:
       - "[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
 concurrency:
@@ -26,19 +28,36 @@ defaults:
     shell: bash
 
 jobs:
-  build:
+  version:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
     steps:
       - name: Resolve version from the tag
         id: v
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::run on a tag X.Y, got '$GITHUB_REF_NAME'"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^([0-9]+\.[0-9]+)(\.[0-9]+)?$ ]]; then
+            echo "::error::run on a tag X.Y or X.Y.Z, got '$GITHUB_REF_NAME'"
             exit 1
           fi
-          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
 
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TOOLKIT: ghcr.io/scc-digitalhub/tvm-toolkit:${{ needs.version.outputs.tag }}
+      REF: ghcr.io/scc-digitalhub/tvm-runtime-rust:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+    steps:
       - uses: actions/checkout@v4
 
       - name: Log in to ghcr.io
@@ -48,24 +67,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Take TVM from tvm-toolkit
         run: |
-          toolkit="$TOOLKIT_IMAGE:${{ steps.v.outputs.tag }}"
-          docker pull "$toolkit"
-          label() { docker inspect -f "{{ index .Config.Labels \"$1\" }}" "$toolkit"; }
+          command -v cc >/dev/null && command -v readelf >/dev/null \
+            || { sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential; }
+          docker pull --platform "linux/${{ matrix.arch }}" "$TOOLKIT"
+          arch="$(docker image inspect -f '{{.Architecture}}' "$TOOLKIT")"
+          if [ "$arch" != "${{ matrix.arch }}" ]; then
+            echo "::error::$TOOLKIT resolved to $arch, expected ${{ matrix.arch }} (is the toolkit multi-arch?)"
+            exit 1
+          fi
+          label() { docker inspect -f "{{ index .Config.Labels \"$1\" }}" "$TOOLKIT"; }
           version="$(label org.opencontainers.image.version)"
           revision="$(label org.opencontainers.image.revision)"
           ffi_version="$(label org.digitalhub.tvm-ffi.version)"
           ffi_revision="$(label org.digitalhub.tvm-ffi.revision)"
           for value in "$version" "$revision" "$ffi_version" "$ffi_revision"; do
             if [ -z "$value" ] || [ "$value" = "<no value>" ]; then
-              echo "::error::$toolkit has no TVM version labels: rebuild it with the digitalhub-tvm-toolkit workflow"
+              echo "::error::$TOOLKIT has no TVM version labels: rebuild it with the digitalhub-tvm-toolkit workflow"
               exit 1
             fi
           done
           tvm_build="$RUNNER_TEMP/tvm-build"
           mkdir -p "$tvm_build/lib"
-          cid="$(docker create "$toolkit")"
+          cid="$(docker create --platform "linux/${{ matrix.arch }}" "$TOOLKIT")"
           docker cp "$cid:/opt/tvm/lib/libtvm_runtime.so" "$tvm_build/lib/"
           docker cp "$cid:/opt/tvm/lib/libtvm_ffi.so" "$tvm_build/lib/"
           docker rm "$cid"
@@ -78,7 +105,7 @@ jobs:
           git -C "$RUNNER_TEMP/tvm" submodule update --init --depth 1 3rdparty/tvm-ffi
           if [ "$(git -C "$RUNNER_TEMP/tvm" rev-parse HEAD)" != "$revision" ] \
             || [ "$(git -C "$RUNNER_TEMP/tvm/3rdparty/tvm-ffi" rev-parse HEAD)" != "$ffi_revision" ]; then
-            echo "::error::apache/tvm v$version does not match the commits $toolkit was built from"
+            echo "::error::apache/tvm v$version does not match the commits $TOOLKIT was built from"
             exit 1
           fi
           {
@@ -113,7 +140,7 @@ jobs:
 
       - name: Stage the image build context
         env:
-          IMAGE_TAG: ${{ steps.v.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
         run: |
           # same layout build-image.sh produces: lib/, tvm-serve and provenance.json at the root
           rm -rf lib tvm-serve provenance.json .tvm-ffi-rust
@@ -133,11 +160,12 @@ jobs:
           manifest = {
               "schema_version": 1,
               "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "platform": "linux/" + os.environ["ARCH"],
               "tvm_version": os.environ["TVM_VERSION"],
               "tvm_git_commit": os.environ["TVM_GIT_COMMIT"],
               "tvm_ffi_version": os.environ["TVM_FFI_VERSION"],
               "tvm_ffi_git_commit": os.environ["TVM_FFI_GIT_COMMIT"],
-              "libraries_from": "{}:{}".format(os.environ["TOOLKIT_IMAGE"], os.environ["IMAGE_TAG"]),
+              "libraries_from": os.environ["TOOLKIT"],
               "build_run": run_url,
               "libraries": {
                   lib.name: hashlib.sha256(lib.read_bytes()).hexdigest()
@@ -150,31 +178,66 @@ jobs:
 
       - name: Build image
         run: |
-          ref="$IMAGE:${{ steps.v.outputs.tag }}"
-          docker build -t "$ref" \
+          docker build -t "$REF" \
             --build-arg "TVM_VERSION=$TVM_VERSION" \
             --build-arg "TVM_GIT_COMMIT=$TVM_GIT_COMMIT" \
             --build-arg "TVM_FFI_VERSION=$TVM_FFI_VERSION" \
             --build-arg "TVM_FFI_GIT_COMMIT=$TVM_FFI_GIT_COMMIT" \
             .
+          arch="$(docker image inspect -f '{{.Architecture}}' "$REF")"
+          if [ "$arch" != "${{ matrix.arch }}" ]; then
+            echo "::error::built $arch instead of ${{ matrix.arch }}"
+            exit 1
+          fi
           for library in libtvm_runtime.so libtvm_ffi.so; do
             want="$(sha256sum "lib/$library" | cut -d' ' -f1)"
-            got="$(docker run --rm --entrypoint /usr/bin/sha256sum "$ref" "/opt/tvm/lib/$library" | cut -d' ' -f1)"
+            got="$(docker run --rm --entrypoint /usr/bin/sha256sum "$REF" "/opt/tvm/lib/$library" | cut -d' ' -f1)"
             if [ "$want" != "$got" ]; then
-              echo "::error::$library in $ref differs from the one taken from tvm-toolkit"
+              echo "::error::$library in $REF differs from the one taken from tvm-toolkit"
               exit 1
             fi
           done
           # every shared library tvm-serve needs must resolve inside the image
-          docker run --rm --entrypoint /bin/sh "$ref" -c '! ldd /usr/local/bin/tvm-serve | grep "not found"'
+          docker run --rm --entrypoint /bin/sh "$REF" -c '! ldd /usr/local/bin/tvm-serve | grep "not found"'
 
       - name: Push image
+        run: docker push "$REF"
+
+  manifest:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Publish the multi-arch tag
         run: |
-          ref="$IMAGE:${{ steps.v.outputs.tag }}"
-          docker push "$ref"
+          docker buildx imagetools create -t "$IMAGE:$TAG" "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > index.json
+          python3 - index.json <<'PY'
+          import json
+          import sys
+
+          index = json.load(open(sys.argv[1]))
+          platforms = sorted(
+              "{}/{}".format(m["platform"]["os"], m["platform"]["architecture"])
+              for m in index.get("manifests", [])
+              if m.get("platform", {}).get("os") != "unknown"
+          )
+          print("platforms:", platforms)
+          sys.exit(0 if platforms == ["linux/amd64", "linux/arm64"] else 1)
+          PY
           {
-            echo "### Published \`$ref\`"
-            echo "TVM $TVM_VERSION ($TVM_GIT_COMMIT), libraries from \`$TOOLKIT_IMAGE:${{ steps.v.outputs.tag }}\`"
+            echo "### Published \`$IMAGE:$TAG\` (linux/amd64, linux/arm64)"
+            echo "TVM libraries from \`$TOOLKIT_IMAGE:$TAG\`"
             echo ""
             echo "On the first publish make the package public: organization → Packages → tvm-runtime-rust → Package settings."
           } >> "$GITHUB_STEP_SUMMARY"
