@@ -1,0 +1,47 @@
+Upstream apache/tvm-ffi: the Rust crates do not compile for 32-bit targets (armv7).
+TVMFFIObject declares the field __padding twice when target_pointer_width is 32.
+This renames the 32-bit one and initialises it where the struct is built; the layout
+stays the one of the C header (24 bytes, align 8). Drop it once fixed upstream.
+
+diff -ru a/rust/tvm-ffi/src/object.rs b/rust/tvm-ffi/src/object.rs
+--- a/rust/tvm-ffi/src/object.rs
++++ b/rust/tvm-ffi/src/object.rs
+@@ -410,6 +410,8 @@
+                     type_index: T::type_index(),
+                     __padding: 0,
+                     deleter: Some(unsafe_::object_deleter_for_new::<T>),
++                    #[cfg(target_pointer_width = "32")]
++                    __padding_ptr32: 0,
+                 },
+             );
+             // move into the object arc ptr
+@@ -448,6 +450,8 @@
+                     type_index: T::type_index(),
+                     __padding: 0,
+                     deleter: Some(unsafe_::object_deleter_for_new_with_extra_items::<T, U>),
++                    #[cfg(target_pointer_width = "32")]
++                    __padding_ptr32: 0,
+                 },
+             );
+             // move into the object arc ptr
+diff -ru a/rust/tvm-ffi-sys/src/c_api.rs b/rust/tvm-ffi-sys/src/c_api.rs
+--- a/rust/tvm-ffi-sys/src/c_api.rs
++++ b/rust/tvm-ffi-sys/src/c_api.rs
+@@ -160,7 +160,7 @@
+     pub deleter: Option<TVMFFIObjectDeleter>,
+     // private padding to ensure 8 bytes alignment
+     #[cfg(target_pointer_width = "32")]
+-    __padding: u32,
++    pub __padding_ptr32: u32,
+ }
+ 
+ impl TVMFFIObject {
+@@ -170,6 +170,8 @@
+             type_index: 0,
+             __padding: 0,
+             deleter: None,
++            #[cfg(target_pointer_width = "32")]
++            __padding_ptr32: 0,
+         }
+     }
+ }

@@ -1,8 +1,8 @@
-# Builds the multi-arch image ghcr.io/scc-digitalhub/tvm-runtime-rust:<X.Y> (linux/amd64
-# and linux/arm64) when a tag X.Y or X.Y.Z is pushed. Each architecture compiles tvm-serve
-# natively against the TVM libraries of the same variant of
-# ghcr.io/scc-digitalhub/tvm-toolkit:<X.Y> (which must be published, and public, first)
-# and pushes <X.Y>-<arch>; the manifest job then publishes <X.Y>.
+# Builds the multi-arch image ghcr.io/scc-digitalhub/tvm-runtime-rust:<X.Y> when a tag X.Y or
+# X.Y.Z is pushed, for every architecture runtime-tvm compiles models for: linux/amd64 and
+# linux/arm64 are built natively against the matching variant of
+# ghcr.io/scc-digitalhub/tvm-toolkit:<X.Y> (which must be published, and public, first),
+# linux/arm/v7 is cross-compiled. Each pushes <X.Y>-<arch>; the manifest job publishes <X.Y>.
 name: tvm-runtime-rust image
 
 on:
@@ -207,8 +207,188 @@ jobs:
       - name: Push image
         run: docker push "$REF"
 
+  # linux/arm/v7, the armv7l target of runtime-tvm. GitHub has no armv7 runners: the TVM
+  # runtime and tvm-serve are cross-compiled on amd64, QEMU only runs the image checks.
+  build-armv7:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TOOLKIT: ghcr.io/scc-digitalhub/tvm-toolkit:${{ needs.version.outputs.tag }}
+      REF: ghcr.io/scc-digitalhub/tvm-runtime-rust:${{ needs.version.outputs.tag }}-armv7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # only the arm/v7 image steps run emulated; the code is cross-compiled natively
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Install the armv7 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf ninja-build
+
+      - name: Cross-compile the TVM runtime for armv7
+        run: |
+          # same TVM as tvm-toolkit: its labels are identical on every variant
+          docker pull --platform linux/amd64 "$TOOLKIT"
+          label() { docker inspect -f "{{ index .Config.Labels \"$1\" }}" "$TOOLKIT"; }
+          version="$(label org.opencontainers.image.version)"
+          revision="$(label org.opencontainers.image.revision)"
+          ffi_version="$(label org.digitalhub.tvm-ffi.version)"
+          ffi_revision="$(label org.digitalhub.tvm-ffi.revision)"
+          for value in "$version" "$revision" "$ffi_version" "$ffi_revision"; do
+            if [ -z "$value" ] || [ "$value" = "<no value>" ]; then
+              echo "::error::$TOOLKIT has no TVM version labels: rebuild it with the digitalhub-tvm-toolkit workflow"
+              exit 1
+            fi
+          done
+          src="$RUNNER_TEMP/tvm"
+          git clone --depth 1 --branch "v$version" https://github.com/apache/tvm "$src"
+          git -C "$src" submodule update --init --depth 1 3rdparty/tvm-ffi
+          # tvm-ffi needs its own submodules (dlpack, libbacktrace) to configure
+          git -C "$src/3rdparty/tvm-ffi" submodule update --init --depth 1
+          if [ "$(git -C "$src" rev-parse HEAD)" != "$revision" ] \
+            || [ "$(git -C "$src/3rdparty/tvm-ffi" rev-parse HEAD)" != "$ffi_revision" ]; then
+            echo "::error::apache/tvm v$version does not match the commits $TOOLKIT was built from"
+            exit 1
+          fi
+          build="$RUNNER_TEMP/tvm-armv7"
+          mkdir -p "$build"
+          cp "$src/cmake/config.cmake" "$build/config.cmake"
+          # runtime only: no LLVM and nothing from the compiler side
+          {
+            echo "set(USE_LLVM OFF)"
+            echo "set(CMAKE_BUILD_TYPE Release)"
+            echo "set(USE_GTEST OFF)"
+          } >> "$build/config.cmake"
+          cmake -S "$src" -B "$build" -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=armv7l \
+            -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++
+          ninja -C "$build" tvm_runtime
+          for library in libtvm_runtime.so libtvm_ffi.so; do
+            file "$build/lib/$library"
+            if ! file "$build/lib/$library" | grep -q "ELF 32-bit LSB shared object, ARM"; then
+              echo "::error::$library is not an armv7 library"
+              exit 1
+            fi
+          done
+          {
+            echo "TVM_VERSION=$version"
+            echo "TVM_GIT_COMMIT=$revision"
+            echo "TVM_FFI_VERSION=$ffi_version"
+            echo "TVM_FFI_GIT_COMMIT=$ffi_revision"
+            echo "TVM_SRC=$src"
+            echo "TVM_BUILD=$build"
+          } >> "$GITHUB_ENV"
+
+      - name: Build tvm-serve for armv7
+        run: |
+          # the tvm-ffi Rust crates do not compile for 32-bit targets upstream (see the patch header)
+          patch -p1 --forward -d "$TVM_SRC/3rdparty/tvm-ffi" < patches/tvm-ffi-rust-32bit.patch
+          chmod +x scripts/tvm-ffi-config
+          ln -sfn "$TVM_SRC/3rdparty/tvm-ffi/rust" .tvm-ffi-rust
+          # link-time stub for -ltvm_ffi_testing, as in the native builds
+          arm-linux-gnueabihf-gcc -shared -x c /dev/null -o "$TVM_BUILD/lib/libtvm_ffi_testing.so"
+          PATH="$GITHUB_WORKSPACE/scripts:$PATH" \
+            TVM_BUILD_DIR="$TVM_BUILD" \
+            TVM_FFI_LIBDIR="$TVM_BUILD/lib" \
+            CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+            cargo build --locked --release --target armv7-unknown-linux-gnueabihf --bin tvm-serve
+          needed="$(arm-linux-gnueabihf-readelf -d target/armv7-unknown-linux-gnueabihf/release/tvm-serve)"
+          for library in libtvm_ffi.so libtvm_runtime.so; do
+            if ! grep -F "Shared library: [$library]" <<<"$needed" >/dev/null; then
+              echo "::error::tvm-serve is not linked to $library"
+              exit 1
+            fi
+          done
+          if grep -F "libtvm_ffi_testing" <<<"$needed"; then
+            echo "::error::tvm-serve needs libtvm_ffi_testing.so, which the image does not ship"
+            exit 1
+          fi
+
+      - name: Stage the image build context
+        run: |
+          # same layout build-image.sh produces: lib/, tvm-serve and provenance.json at the root
+          rm -rf lib tvm-serve provenance.json .tvm-ffi-rust
+          mkdir -p lib
+          cp "$TVM_BUILD/lib/libtvm_runtime.so" "$TVM_BUILD/lib/libtvm_ffi.so" lib/
+          arm-linux-gnueabihf-strip --strip-debug lib/*.so
+          cp target/armv7-unknown-linux-gnueabihf/release/tvm-serve tvm-serve
+          python3 - "." <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          target = Path(sys.argv[1])
+          run_url = "{}/{}/actions/runs/{}".format(
+              os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]
+          )
+          manifest = {
+              "schema_version": 1,
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "platform": "linux/arm/v7",
+              "tvm_version": os.environ["TVM_VERSION"],
+              "tvm_git_commit": os.environ["TVM_GIT_COMMIT"],
+              "tvm_ffi_version": os.environ["TVM_FFI_VERSION"],
+              "tvm_ffi_git_commit": os.environ["TVM_FFI_GIT_COMMIT"],
+              "libraries_from": "apache/tvm v{} runtime, cross-compiled for armv7".format(os.environ["TVM_VERSION"]),
+              "build_run": run_url,
+              "libraries": {
+                  lib.name: hashlib.sha256(lib.read_bytes()).hexdigest()
+                  for lib in sorted((target / "lib").glob("*.so"))
+              },
+          }
+          (target / "provenance.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Build image
+        run: |
+          docker build --platform linux/arm/v7 -t "$REF" \
+            --build-arg "TVM_VERSION=$TVM_VERSION" \
+            --build-arg "TVM_GIT_COMMIT=$TVM_GIT_COMMIT" \
+            --build-arg "TVM_FFI_VERSION=$TVM_FFI_VERSION" \
+            --build-arg "TVM_FFI_GIT_COMMIT=$TVM_FFI_GIT_COMMIT" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.description=$DESCRIPTION" \
+            .
+          platform="$(docker image inspect -f '{{.Os}}/{{.Architecture}}/{{.Variant}}' "$REF")"
+          if [ "$platform" != "linux/arm/v7" ]; then
+            echo "::error::built $platform instead of linux/arm/v7"
+            exit 1
+          fi
+          for library in libtvm_runtime.so libtvm_ffi.so; do
+            want="$(sha256sum "lib/$library" | cut -d' ' -f1)"
+            got="$(docker run --rm --platform linux/arm/v7 --entrypoint /usr/bin/sha256sum "$REF" "/opt/tvm/lib/$library" | cut -d' ' -f1)"
+            if [ "$want" != "$got" ]; then
+              echo "::error::$library in $REF differs from the cross-compiled one"
+              exit 1
+            fi
+          done
+          docker run --rm --platform linux/arm/v7 --entrypoint /bin/sh "$REF" -c '! ldd /usr/local/bin/tvm-serve | grep "not found"'
+
+      - name: Push image
+        run: docker push "$REF"
+
   manifest:
-    needs: [version, build]
+    needs: [version, build, build-armv7]
     runs-on: ubuntu-24.04
     env:
       TAG: ${{ needs.version.outputs.tag }}
@@ -227,7 +407,7 @@ jobs:
           docker buildx imagetools create -t "$IMAGE:$TAG" \
             --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
-            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64" "$IMAGE:$TAG-armv7"
           docker buildx imagetools inspect --raw "$IMAGE:$TAG" > index.json
           python3 - index.json <<'PY'
           import json
@@ -236,14 +416,15 @@ jobs:
           index = json.load(open(sys.argv[1]))
           platforms = sorted(
               "{}/{}".format(m["platform"]["os"], m["platform"]["architecture"])
+              + ("/" + m["platform"]["variant"] if m["platform"]["architecture"] == "arm" else "")
               for m in index.get("manifests", [])
               if m.get("platform", {}).get("os") != "unknown"
           )
           print("platforms:", platforms)
-          sys.exit(0 if platforms == ["linux/amd64", "linux/arm64"] else 1)
+          sys.exit(0 if platforms == ["linux/amd64", "linux/arm/v7", "linux/arm64"] else 1)
           PY
           {
-            echo "### Published \`$IMAGE:$TAG\` (linux/amd64, linux/arm64)"
+            echo "### Published \`$IMAGE:$TAG\` (linux/amd64, linux/arm64, linux/arm/v7)"
             echo "TVM libraries from \`$TOOLKIT_IMAGE:$TAG\`"
             echo ""
             echo "On the first publish make the package public: organization → Packages → tvm-runtime-rust → Package settings."
