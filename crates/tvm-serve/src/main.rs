@@ -13,6 +13,8 @@
 //! TVM_SERVE_PORT       REST port (default 8080)
 //! TVM_SERVE_GRPC_PORT  gRPC port (default 9000)
 //! TVM_SERVE_WORKERS    inference workers / model copies (default 1)
+//! TVM_NUM_THREADS      TVM threads of each worker, read by the TVM runtime itself
+//!                      (default: every core; CORE splits the pod CPUs among workers)
 //! ```
 mod grpc;
 mod protocol;
@@ -47,7 +49,12 @@ async fn main() -> anyhow::Result<()> {
     let grpc_port = env_u16("TVM_SERVE_GRPC_PORT", 9000);
     let workers = env_usize("TVM_SERVE_WORKERS", 1);
 
-    eprintln!("[tvm-serve] loading model from {model_dir} (name='{model_name}', workers={workers})...");
+    // Each worker thread gets its own TVM thread pool of this size.
+    let threads = std::env::var("TVM_NUM_THREADS").unwrap_or_else(|_| "default".to_string());
+
+    eprintln!(
+        "[tvm-serve] loading model from {model_dir} (name='{model_name}', workers={workers}, tvm_threads={threads})..."
+    );
     let handle = worker::start(&model_dir, model_name, workers)?;
     eprintln!(
         "[tvm-serve] model ready: entry='{}' inputs={:?} outputs={:?}",
@@ -274,10 +281,10 @@ mod tests {
     fn quantized_tensor_publishes_parameters() {
         let m = to_tensor_metadata(&spec("int8", vec![0.003921568859368563], vec![-128]));
         assert_eq!(m.datatype, "INT8");
-        let p = m.parameters.expect("un tensore quantizzato deve esporre i parametri");
+        let p = m.parameters.expect("a quantized tensor must publish its parameters");
         assert_eq!(p["scale"][0], 0.003921568859368563);
         assert_eq!(p["zero_point"][0], -128);
-        assert!(p.get("quantized_dimension").is_none(), "per-tensore: nessun asse");
+        assert!(p.get("quantized_dimension").is_none(), "per-tensor quantization: no axis");
     }
 
     /// Per-axis quantization also carries the axis the entries are indexed by.
@@ -299,6 +306,6 @@ mod tests {
         assert!(m.parameters.is_none());
 
         let raw = serde_json::to_string(&m).unwrap();
-        assert!(!raw.contains("parameters"), "JSON inatteso: {raw}");
+        assert!(!raw.contains("parameters"), "unexpected JSON: {raw}");
     }
 }

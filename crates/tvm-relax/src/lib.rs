@@ -81,13 +81,117 @@ pub struct Metadata {
     pub entry: String,
     pub inputs: Vec<TensorSpec>,
     pub outputs: Vec<TensorSpec>,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub tvm_version: String,
+    #[serde(default)]
+    pub tvm_git_commit: String,
 }
 
 impl Metadata {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
         serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {path}: {e}"))
+    }
+
+    pub fn validate_runtime(
+        &self,
+        runtime_version: &str,
+        runtime_commit: &str,
+        runtime_arch: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !runtime_version.is_empty() && runtime_version != "unknown",
+            "serve image has no embedded TVM version"
+        );
+        anyhow::ensure!(
+            !runtime_commit.is_empty() && runtime_commit != "unknown",
+            "serve image has no embedded TVM source revision"
+        );
+        anyhow::ensure!(
+            !self.tvm_version.is_empty(),
+            "model metadata has no tvm_version"
+        );
+        anyhow::ensure!(
+            self.tvm_version == runtime_version,
+            "model TVM version {:?} is incompatible with serve image version {:?}",
+            self.tvm_version,
+            runtime_version
+        );
+        anyhow::ensure!(
+            !self.tvm_git_commit.is_empty(),
+            "model metadata has no tvm_git_commit; recompile it with an attested toolkit"
+        );
+        anyhow::ensure!(
+            self.tvm_git_commit == runtime_commit,
+            "model TVM revision {:?} is incompatible with serve image revision {:?}",
+            self.tvm_git_commit,
+            runtime_commit
+        );
+        validate_llvm_target(&self.target, runtime_arch)
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct LlvmTarget {
+    kind: String,
+    #[serde(default)]
+    mtriple: String,
+}
+
+fn validate_llvm_target(target_text: &str, runtime_arch: &str) -> anyhow::Result<()> {
+    let target_text = target_text.trim();
+    anyhow::ensure!(!target_text.is_empty(), "model metadata has no target");
+
+    let target = if target_text.starts_with('{') {
+        serde_json::from_str::<LlvmTarget>(target_text)
+            .map_err(|e| anyhow::anyhow!("invalid TVM target {target_text:?}: {e}"))?
+    } else {
+        let mut fields = target_text.split_whitespace();
+        let kind = fields.next().unwrap_or_default().to_string();
+        let mtriple = fields
+            .find_map(|field| field.strip_prefix("-mtriple="))
+            .unwrap_or_default()
+            .to_string();
+        LlvmTarget { kind, mtriple }
+    };
+
+    anyhow::ensure!(
+        target.kind == "llvm",
+        "serve image supports LLVM CPU models, got target kind {:?}",
+        target.kind
+    );
+    if target.mtriple.is_empty() {
+        return Ok(());
+    }
+
+    let target_arch = target
+        .mtriple
+        .split('-')
+        .next()
+        .and_then(canonical_arch)
+        .ok_or_else(|| anyhow::anyhow!("unsupported LLVM target triple {:?}", target.mtriple))?;
+    let runtime_arch = canonical_arch(runtime_arch)
+        .ok_or_else(|| anyhow::anyhow!("unsupported serve image architecture {runtime_arch:?}"))?;
+    anyhow::ensure!(
+        target_arch == runtime_arch,
+        "model target triple {:?} is incompatible with runtime architecture {:?}",
+        target.mtriple,
+        runtime_arch
+    );
+    Ok(())
+}
+
+fn canonical_arch(arch: &str) -> Option<&'static str> {
+    match arch.to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" => Some("x86_64"),
+        "aarch64" | "arm64" => Some("aarch64"),
+        arch if arch.starts_with("arm") => Some("arm"),
+        "riscv64" => Some("riscv64"),
+        "powerpc64" | "powerpc64le" | "ppc64le" => Some("powerpc64"),
+        "s390x" => Some("s390x"),
+        _ => None,
     }
 }
 
@@ -114,14 +218,7 @@ impl RelaxModel {
         // vm_initialization wants one (device_type, device_id, alloc_type) triple
         // per device: compute then host. Both are CPU, so the same triple twice.
         let init = ffi(vm.get_function("vm_initialization"))?;
-        ffi(init.call_tuple((
-            KDLCPU,
-            0i32,
-            ALLOC_POOLED,
-            KDLCPU,
-            0i32,
-            ALLOC_POOLED,
-        )))?;
+        ffi(init.call_tuple((KDLCPU, 0i32, ALLOC_POOLED, KDLCPU, 0i32, ALLOC_POOLED)))?;
 
         // Resolve the entry PackedFunc once, so `run` is a direct call.
         let entry_fn = ffi(vm.get_function(entry))?;
@@ -208,5 +305,31 @@ mod tests {
         let raw = r#"{"entry":"main","inputs":[{"name":"x","shape":[1]}],"outputs":[]}"#;
         let m: Metadata = serde_json::from_str(raw).unwrap();
         assert_eq!(m.inputs[0].dtype, "float32");
+    }
+
+    #[test]
+    fn metadata_accepts_matching_runtime_identity_and_target() {
+        let raw = r#"{"entry":"main","inputs":[],"outputs":[],
+            "tvm_version":"0.26.0","tvm_git_commit":"c7b458e",
+            "target":"{\"kind\":\"llvm\",\"mtriple\":\"x86_64-pc-linux-gnu\"}"}"#;
+        let m: Metadata = serde_json::from_str(raw).unwrap();
+        m.validate_runtime("0.26.0", "c7b458e", "x86_64").unwrap();
+    }
+
+    #[test]
+    fn metadata_rejects_incompatible_runtime_identity_and_target() {
+        let mut m: Metadata = serde_json::from_str(
+            r#"{"entry":"main","inputs":[],"outputs":[],
+                "tvm_version":"0.26.0","tvm_git_commit":"c7b458e","target":"llvm"}"#,
+        )
+        .unwrap();
+
+        assert!(m.validate_runtime("unknown", "c7b458e", "x86_64").is_err());
+        assert!(m.validate_runtime("0.25.0", "c7b458e", "x86_64").is_err());
+        assert!(m.validate_runtime("0.26.0", "different", "x86_64").is_err());
+        m.target = "cuda".to_string();
+        assert!(m.validate_runtime("0.26.0", "c7b458e", "x86_64").is_err());
+        m.target = r#"{"kind":"llvm","mtriple":"aarch64-linux-gnu"}"#.to_string();
+        assert!(m.validate_runtime("0.26.0", "c7b458e", "x86_64").is_err());
     }
 }

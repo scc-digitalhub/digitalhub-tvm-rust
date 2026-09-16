@@ -17,6 +17,15 @@ use tvm_relax::{Metadata, RelaxModel, TensorSpec};
 
 use crate::protocol::TensorData;
 
+const RUNTIME_TVM_VERSION: &str = match option_env!("TVM_VERSION") {
+    Some(version) => version,
+    None => "unknown",
+};
+const RUNTIME_TVM_GIT_COMMIT: &str = match option_env!("TVM_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
 pub struct InferInput {
     pub name: String,
     pub shape: Vec<i64>,
@@ -54,8 +63,14 @@ impl Handle {
         name: &str,
         inputs: Vec<InferInput>,
     ) -> Result<Vec<InferOutput>, ServeErr> {
-        let desc: Vec<String> = inputs.iter().map(|i| format!("{}:{:?}", i.name, i.shape)).collect();
-        eprintln!("[tvm-serve] infer req model={name} inputs=[{}]", desc.join(", "));
+        let desc: Vec<String> = inputs
+            .iter()
+            .map(|i| format!("{}:{:?}", i.name, i.shape))
+            .collect();
+        eprintln!(
+            "[tvm-serve] infer req model={name} inputs=[{}]",
+            desc.join(", ")
+        );
         let result = self.serve_infer_inner(name, inputs).await;
         // Validation rejections are only visible here; runtime errors are logged by the worker thread.
         if let Err(ServeErr::NotFound(m) | ServeErr::BadRequest(m)) = &result {
@@ -84,7 +99,12 @@ impl Handle {
         }
         // When every input is named and the name set matches exactly, reorder to
         // metadata order; otherwise fall back to positional matching.
-        let meta_names: Vec<&str> = self.metadata.inputs.iter().map(|t| t.name.as_str()).collect();
+        let meta_names: Vec<&str> = self
+            .metadata
+            .inputs
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
         let mut inputs = inputs;
         let names_match = !meta_names.is_empty() && inputs.iter().all(|i| !i.name.is_empty()) && {
             let mut req: Vec<&str> = inputs.iter().map(|i| i.name.as_str()).collect();
@@ -94,7 +114,12 @@ impl Handle {
             req == meta
         };
         if names_match {
-            inputs.sort_by_key(|i| meta_names.iter().position(|n| *n == i.name).unwrap_or(usize::MAX));
+            inputs.sort_by_key(|i| {
+                meta_names
+                    .iter()
+                    .position(|n| *n == i.name)
+                    .unwrap_or(usize::MAX)
+            });
         }
         for (idx, i) in inputs.iter().enumerate() {
             crate::protocol::validate_shape(idx, &i.shape, i.data.len())
@@ -119,6 +144,11 @@ impl Handle {
 /// the model so `ready` is real. `workers` is clamped to at least 1.
 pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Result<Handle> {
     let meta = Metadata::from_file(&format!("{model_dir}/metadata.json"))?;
+    meta.validate_runtime(
+        RUNTIME_TVM_VERSION,
+        RUNTIME_TVM_GIT_COMMIT,
+        std::env::consts::ARCH,
+    )?;
     // Fail fast at startup on an unservable dtype rather than per-request; FP16/bool deferred.
     const SUPPORTED: &[&str] = &[
         "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32",

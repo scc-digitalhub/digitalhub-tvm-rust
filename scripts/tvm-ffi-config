@@ -3,7 +3,13 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Shim `tvm-ffi-config` (non prodotto da cmake): tvm-ffi-sys/build.rs lo invoca
-# per trovare libtvm_ffi.so. Metterlo su PATH quando si compila; override TVM_FFI_LIBDIR.
-LIBDIR="${TVM_FFI_LIBDIR:-/home/ltrubbiani/tvm/src/tvm-current/build/lib}"
-echo "$LIBDIR"
+# Stand-in for `tvm-ffi-config` (cmake does not install one): tvm-ffi-sys/build.rs
+# calls it to find libtvm_ffi.so. The caller must point TVM_FFI_LIBDIR at the verified build.
+set -eu
+[ "${1:-}" = "--libdir" ] || { echo "usage: tvm-ffi-config --libdir" >&2; exit 2; }
+: "${TVM_FFI_LIBDIR:?TVM_FFI_LIBDIR must point at the verified TVM build/lib}"
+[ -f "$TVM_FFI_LIBDIR/libtvm_ffi.so" ] || {
+	echo "libtvm_ffi.so not found under $TVM_FFI_LIBDIR" >&2
+	exit 1
+}
+printf '%s\n' "$TVM_FFI_LIBDIR"

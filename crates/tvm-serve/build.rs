@@ -24,7 +24,7 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/grpc_predict_v2.proto");
 
     let build_dir = env::var("TVM_BUILD_DIR")
-        .unwrap_or_else(|_| "/home/ltrubbiani/tvm/src/tvm-current/build".to_string());
+        .expect("TVM_BUILD_DIR must point at the verified Apache TVM build");
     let lib_dir = format!("{build_dir}/lib");
 
     println!("cargo:rustc-link-search=native={lib_dir}");
@@ -37,9 +37,11 @@ fn main() {
     println!("cargo:rustc-link-arg=-ltvm_runtime");
     println!("cargo:rustc-link-arg=-Wl,--as-needed");
 
-    // rpath so libtvm_runtime.so is found at runtime without LD_LIBRARY_PATH.
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+    // Keep the release binary independent from the build host path.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
     // Rebuild if the runtime lib changes (e.g. tvm-current repointed) to avoid an ABI-stale link.
     println!("cargo:rerun-if-changed={lib_dir}/libtvm_runtime.so");
     println!("cargo:rerun-if-env-changed=TVM_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=TVM_VERSION");
+    println!("cargo:rerun-if-env-changed=TVM_GIT_COMMIT");
 }

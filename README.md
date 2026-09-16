@@ -2,7 +2,9 @@
 
 Native **Rust** serving of compiled **TVM Relax** models. This standalone project
 builds the `tvm-serve` binary and packages it into the **`tvm-runtime-rust`**
-container image that DigitalHub CORE launches for its **`tvm+serve`** task.
+container image, one of the two serve images DigitalHub CORE can launch for its
+**`tvm+serve`** task (the other, and the default, is the Go runtime of
+`digitalhub-serverless`).
 
 The image is **model-centric**: nothing model-specific is baked in. At startup
 `tvm-serve` reads `model.so` + `metadata.json` from `$TVM_MODEL_DIR` and exposes
@@ -10,21 +12,21 @@ the model over the **Open Inference Protocol v2** (KServe) on **REST `:8080`** a
 **gRPC `:9000`**. Inference runs directly on the TVM VirtualMachine driven from
 Rust.
 
-> This project was moved out of the CORE monorepo. It no longer lives under
-> `runtime-tvm`, and it has no dependency on the old Kaniko multistage build, the
-> in-tree `docker/` assets, or any `examples/` / `rebuild-images.sh` tooling —
-> those are gone. The only artifact it produces is the `tvm-runtime-rust` image.
+Startup fails closed unless the model metadata TVM version and source revision
+match the immutable identity compiled into the server from the verified build,
+and the model declares an LLVM target compatible with the runtime architecture.
 
 ## Purpose
 
 CORE's `tvm+serve` needs a base image that can take a freshly compiled Relax
-`model.so` and serve it. `tvm-runtime-rust` is that image:
+`model.so` and serve it. `tvm-runtime-rust` is such an image:
 
 - a single self-contained `tvm-serve` binary + the TVM runtime `.so`s;
 - model-agnostic — the model is injected at deploy time (init container), not
   baked;
 - serves OpenInference v2 over REST and gRPC from the same process;
-- **CPU only**, native dtypes (FP16 deferred).
+- **CPU only**, native dtypes (FP16 deferred);
+- published for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
 
 ## Architecture
 
@@ -55,11 +57,16 @@ With **N** workers up to N inferences run concurrently, at the cost of N model
 copies in memory. The pool size is set by `TVM_SERVE_WORKERS` (default `1`); with a
 single worker inferences are serialized — one at a time.
 
+Each worker thread also gets its **own TVM thread pool** for the operators of one
+inference, sized by `TVM_NUM_THREADS`. Keep `workers × TVM_NUM_THREADS` within the
+CPUs of the pod: CORE does this for you by splitting the requested CPUs among the
+workers.
+
 ### Crates
 
-| Crate | Path | Role |
-|-------|------|------|
-| `tvm-relax` | `crates/tvm-relax` | The `RelaxModel` inference library. Loads `model.so` and drives the Relax VirtualMachine through raw `PackedFunc` calls over the `tvm-ffi` C ABI. `src/lib.rs` is the core. |
+| Crate       | Path               | Role                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tvm-relax` | `crates/tvm-relax` | The `RelaxModel` inference library. Loads `model.so` and drives the Relax VirtualMachine through raw `PackedFunc` calls over the `tvm-ffi` C ABI. `src/lib.rs` is the core.                                                                                                                                                                                                                                                                        |
 | `tvm-serve` | `crates/tvm-serve` | The server binary. `main.rs` reads env config, spins up the worker pool (each thread loads its own model copy), starts REST + gRPC. `worker.rs` is the pool of model-owning threads + the shared inference queue. `protocol.rs` has the REST OpenInference v2 handlers and the v2 JSON structs. `grpc.rs` implements the gRPC `GRPCInferenceService`. `build.rs` compiles the proto and does the native link setup (force-links `libtvm_runtime`). |
 
 ### The crux: driving the Relax VM from Rust
@@ -84,45 +91,37 @@ A single Relax output Tensor or an output tuple (`Array<Tensor>`) is normalized 
 binary never references its symbols directly, so the default `--as-needed` linker
 behavior would drop it and the VM loader would not be registered at runtime.
 `tvm-serve/build.rs` wraps `-ltvm_runtime` in `--no-as-needed` / `--as-needed` and
-adds an rpath. (`cargo:rustc-link-arg` does not propagate from a dependency to the
+adds a relative `$ORIGIN` rpath. (`cargo:rustc-link-arg` does not propagate from a dependency to the
 binary crate, so the setup lives in the binary crate's `build.rs`.)
 
 ## Building the image
 
-`./build-image.sh` compiles `tvm-serve` in release mode and packages it with the
-TVM runtime `.so`s into `tvm-runtime-rust:<tag>`.
+The image is built by GitHub Actions (`.github/workflows/tvm-runtime-rust-image.yml`)
+when a tag is pushed. **The image tag is the git tag**, and it names the Apache TVM
+release: pushing `0.26.0` publishes `ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0`
+built on TVM `0.26.0`. For each architecture the workflow:
 
-```bash
-./build-image.sh            # build the image
-./build-image.sh --load     # ...and `minikube image load` it
-./build-image.sh --push     # ...and push to $REGISTRY
-```
+1. compiles only the TVM runtime (`libtvm_runtime.so`, `libtvm_ffi.so`, no LLVM) from
+   that Apache TVM release — natively on amd64 and arm64, cross-compiled for armv7;
+2. builds `tvm-serve` against it with `cargo build --locked --release`. The 32-bit
+   armv7 build applies `patches/tvm-ffi-rust-32bit.patch`, which fixes a duplicated
+   padding field in the upstream `tvm-ffi` Rust bindings;
+3. packages the binary and the two libraries, and checks them inside the image
+   (`ldd`, SHA-256 against the build provenance).
 
-It requires a **locally-built TVM** — the script copies `libtvm_runtime.so` and
-`libtvm_ffi.so` out of the TVM build tree and links `tvm-serve` against them.
+A last job joins the three images into one multi-architecture tag.
 
-| Env var | Default | Meaning |
-|---------|---------|---------|
-| `TVM_HOME` | `$HOME/tvm/src/tvm-current` | Root of the local TVM checkout/build |
-| `TVM_BUILD` | `$TVM_HOME/build` | TVM build dir (must contain `lib/libtvm_runtime.so`) |
-| `TVM_TAG` | derived from `TVM_HOME` (e.g. `tvm-0.25.0` -> `0.25`) | Image tag `major.minor`, matches the packaged TVM |
-| `TAG` | `tvm-runtime-rust:$TVM_TAG` | Full image name:tag |
-| `REGISTRY` | *(empty)* | Push prefix for `--push`: the pushed ref is `$REGISTRY/$TAG`; when empty the bare `$TAG` is pushed |
+The Rust build finds the TVM libraries two ways: `build.rs` requires `TVM_BUILD_DIR`,
+and `tvm-ffi-sys` calls `tvm-ffi-config`, a shim in `scripts/tvm-ffi-config` (put it
+on `PATH` and set `TVM_FFI_LIBDIR`). The ignored relative Cargo path `.tvm-ffi-rust`
+must point at the `tvm-ffi` submodule of the same TVM checkout, so the Rust bindings
+and the packaged library cannot drift.
 
-The Rust build itself resolves the TVM libs two ways: `build.rs` reads
-`TVM_BUILD_DIR` (`build-image.sh` sets it to `$TVM_BUILD`), and `tvm-ffi-sys`'s
-build invokes `tvm-ffi-config` — a shim in `scripts/tvm-ffi-config` (put it on
-`PATH`, override with `TVM_FFI_LIBDIR`). The `tvm-ffi` Rust
-bindings are the ones bundled with the active TVM version and must be ABI-coherent
-with the `.so`s being linked.
-
-The image is based on **`ubuntu:24.04`** (needs the build host's glibc ≥ 2.38 /
-`GLIBCXX_3.4.32`). Artifacts are x86_64/glibc; other architectures require
-rebuilding the binary + `.so`s on that arch.
+The image is based on **`ubuntu:24.04`** (glibc ≥ 2.38 / `GLIBCXX_3.4.32`).
 
 ## How CORE uses it
 
-CORE's `TvmServeRunner` deploys `tvm-runtime-rust` as a Kubernetes Deployment. It
+CORE's `TvmServeRunner` deploys the serve image as a Kubernetes Deployment. It
 is a build-free, model-injection pattern:
 
 ```
@@ -133,38 +132,41 @@ is a build-free, model-injection pattern:
 ```
 
 - An **init container** downloads the compiled `.so` Model folder (`model.so` +
-  `metadata.json`, optional `params.bin`) from S3 into `<home-dir>/model`.
+  `metadata.json`) from S3 into `<home-dir>/model`.
 - `tvm-serve` is pointed there via **`TVM_MODEL_DIR`**, with `TVM_MODEL_NAME` set
   to the served model name (used in `/v2/models/<name>`).
+- `TVM_SERVE_WORKERS` comes from the task `workers`, and `TVM_NUM_THREADS` from the
+  task CPU request divided by the workers.
 - The Deployment declares service ports **8080** (REST) and **9000** (gRPC).
 
-The base serve image is configured by **`runtime.tvm.serve`** (env
-`RUNTIME_TVM_SERVE`), defaulting to
-`ghcr.io/scc-digitalhub/tvm-runtime-rust:0.25`. A `tvm+serve` task can override it
-per-run via `task.image`.
+The serve image is configured by **`runtime.tvm.serve`** (env `RUNTIME_TVM_SERVE`),
+which defaults to the Go image `tvm-runtime-go`. Point it at
+`ghcr.io/scc-digitalhub/tvm-runtime-rust:<version>` to use this image everywhere, or
+set `task.image` on a single `tvm+serve` run.
 
 ### Runtime env config (read by `tvm-serve`)
 
-| Env var | Default | Meaning |
-|---------|---------|---------|
-| `TVM_MODEL_DIR` | `/shared/model` (image: `/model`) | Dir holding `model.so` + `metadata.json` |
-| `TVM_MODEL_NAME` | `model` | Name in `/v2/models/<name>` |
-| `TVM_SERVE_PORT` | `8080` | REST port |
-| `TVM_SERVE_GRPC_PORT` | `9000` | gRPC port |
-| `TVM_SERVE_WORKERS` | `1` | Worker threads in the pool (each loads its own model copy); up to N concurrent inferences. Wired from the `tvm+serve` spec field `task.workers`. |
+| Env var               | Default                  | Meaning                                                                                                                                          |
+| --------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TVM_MODEL_DIR`       | `/shared/model`          | Dir holding `model.so` + `metadata.json`                                                                                                         |
+| `TVM_MODEL_NAME`      | `model`                  | Name in `/v2/models/<name>`                                                                                                                      |
+| `TVM_SERVE_PORT`      | `8080`                   | REST port                                                                                                                                        |
+| `TVM_SERVE_GRPC_PORT` | `9000`                   | gRPC port                                                                                                                                        |
+| `TVM_SERVE_WORKERS`   | `1`                      | Worker threads in the pool (each loads its own model copy); up to N concurrent inferences. Wired from the `tvm+serve` spec field `task.workers`. |
+| `TVM_NUM_THREADS`     | every core (TVM default) | Threads of each worker's TVM thread pool, read by the TVM runtime itself. CORE sets it from the task CPU request divided by the workers.         |
 
 ## OpenInference v2 endpoints
 
 REST (axum) and gRPC (`inference.GRPCInferenceService`) expose the same v2 surface.
 
-| Concern | REST | gRPC |
-|---------|------|------|
-| Server live | `GET /v2/health/live` | `ServerLive` |
-| Server ready | `GET /v2/health/ready` | `ServerReady` |
-| Server metadata | `GET /v2` | `ServerMetadata` |
-| Model ready | `GET /v2/models/:name/ready` | `ModelReady` |
-| Model metadata | `GET /v2/models/:name` | `ModelMetadata` |
-| Infer | `POST /v2/models/:name/infer` (and `/versions/:version/infer`) | `ModelInfer` |
+| Concern         | REST                                                           | gRPC             |
+| --------------- | -------------------------------------------------------------- | ---------------- |
+| Server live     | `GET /v2/health/live`                                          | `ServerLive`     |
+| Server ready    | `GET /v2/health/ready`                                         | `ServerReady`    |
+| Server metadata | `GET /v2`                                                      | `ServerMetadata` |
+| Model ready     | `GET /v2/models/:name/ready`                                   | `ModelReady`     |
+| Model metadata  | `GET /v2/models/:name`                                         | `ModelMetadata`  |
+| Infer           | `POST /v2/models/:name/infer` (and `/versions/:version/infer`) | `ModelInfer`     |
 
 ### Quantized models
 
@@ -173,8 +175,12 @@ QDQ ONNX), `GET /v2/models/:name` adds the affine params under the v2 `parameter
 read from `metadata.json`:
 
 ```json
-{ "name": "images", "datatype": "INT8", "shape": [1, 224, 224, 3],
-  "parameters": { "scale": [0.003921568859368563], "zero_point": [-128] } }
+{
+  "name": "images",
+  "datatype": "INT8",
+  "shape": [1, 224, 224, 3],
+  "parameters": { "scale": [0.003921568859368563], "zero_point": [-128] }
+}
 ```
 
 They are what lets a client quantize its input and dequantize the output —
@@ -184,28 +190,14 @@ quantization into `model.so`); it only forwards them. **Float models keep `param
 absent entirely**, so their response is unchanged. Note the gRPC `ModelMetadata` does
 not carry them: the generated v2 proto has no `parameters` field on `TensorMetadata`.
 
-Inputs are matched **positionally** (client sends tensors in `metadata.inputs`
-order). Input `datatype` may be any of the supported native dtypes — `FP32`,
-`FP64`, `INT8`/`INT16`/`INT32`/`INT64`, `UINT8`/`UINT16`/`UINT32`/`UINT64`; `FP16`
-is not yet supported and is rejected with a clear error. Message limits are raised well above the
-protocol defaults: REST body limit **1 GiB**, gRPC max message **512 MB** (v2
-tensors easily exceed the 2 MB / 4 MB defaults). The gRPC server does **not**
-expose server reflection, so clients need the `.proto`
-(`crates/tvm-serve/proto/grpc_predict_v2.proto`).
-
-## End-to-end testing
-
-The E2E test tooling lives in the CORE repo, next to the runtime that deploys
-this image: `digitalhub-core/runtimes/runtime-tvm/test_infer/run_infer.py`. It
-discovers the running `tvm+serve` from the CORE API, downloads a test image,
-calls inference over **REST or gRPC** (the KServe proto is bundled there), and
-saves the picture with the decoded bounding boxes.
-
-```bash
-cd ../digitalhub-core/runtimes/runtime-tvm/test_infer
-python3 run_infer.py                 # REST
-python3 run_infer.py --mode grpc     # gRPC
-```
+Inputs are matched by name when every input is named and the names match the model,
+otherwise **positionally** (in `metadata.inputs` order). Input `datatype` may be any of
+the supported native dtypes — `FP32`, `FP64`, `INT8`/`INT16`/`INT32`/`INT64`,
+`UINT8`/`UINT16`/`UINT32`/`UINT64`; `FP16` is not yet supported and is rejected with a
+clear error. Message limits are raised well above the protocol defaults: REST body limit
+**1 GiB**, gRPC max message **512 MB** (v2 tensors easily exceed the 2 MB / 4 MB
+defaults). The gRPC server does **not** expose server reflection, so clients need the
+`.proto` (`crates/tvm-serve/proto/grpc_predict_v2.proto`).
 
 ## Limitations
 
@@ -219,8 +211,8 @@ python3 run_infer.py --mode grpc     # gRPC
 
 ## Relation to the Go runtime
 
-The equivalent in the older stack is a native Nuclio runtime in
-**`digitalhub-serverless`** (Go), which does the same job — load a compiled TVM
-model and serve OpenInference v2 — but drives the TVM C runtime through cgo. This
-project is the Rust-native alternative: the same serving contract without cgo,
-packaged as the `tvm-runtime-rust` image that `tvm+serve` launches by default.
+`digitalhub-serverless` ships the equivalent Go runtime (`tvm-runtime-go`), a Nuclio
+processor that drives the same TVM runtime through cgo. It is CORE's default serve
+image. Both serve the same `model.so` with the same `TVM_MODEL_DIR` contract, ports,
+env variables and OpenInference v2 surface, so switching between them needs no
+change to the compile or serve flow.
