@@ -133,3 +133,10 @@ Without `TVM_VERSION` and `TVM_GIT_COMMIT` the binary refuses every model.
 - CPU only, no GPU.
 - One model per pod; no batching and no metrics.
 - `FP16` tensors are not supported yet.
+
+## Copyright and license
+
+Copyright © 2025 DSLab – Fondazione Bruno Kessler and individual contributors.
+
+This project is licensed under the Apache License, Version 2.0.
+You may not use this file except in compliance with the License. Ownership of contributions remains with the original authors and is governed by the terms of the Apache 2.0 License, including the requirement to grant a license to the project.
