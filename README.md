@@ -121,11 +121,10 @@ A last job publishes the multi-architecture tag.
 | ------------------ | ----------------------------------------------------------------------------------------------------------- |
 | `crates/tvm-relax` | Library that loads `model.so`, runs the Relax VM and checks `metadata.json`.                                |
 | `crates/tvm-serve` | The server: `main.rs` (configuration and REST), `worker.rs` (workers), `protocol.rs` (v2 types), `grpc.rs`. |
-| `scripts/`         | `tvm-ffi-config` for the `tvm-ffi` bindings, `verify-tvm-build.py` for the local image build.               |
+| `scripts/`         | `tvm-ffi-config`, which tells the `tvm-ffi` bindings where `libtvm_ffi.so` is.                              |
 | `patches/`         | Fix applied to the `tvm-ffi` Rust bindings for 32-bit ARM.                                                  |
 
-Building needs a local build of the same Apache TVM release (for example with
-`build-tvm.sh` of the DigitalHub TVM Toolkit):
+Building needs a local build of the same Apache TVM release:
 
 ```bash
 TVM=~/tvm/src/tvm-0.26.0
@@ -140,15 +139,6 @@ cargo build --release --bin tvm-serve
 ```
 
 Without `TVM_VERSION` and `TVM_GIT_COMMIT` the binary refuses every model.
-
-To build the image locally, from `~/tvm/src/tvm-current` by default (`TVM_HOME` to change
-it):
-
-```bash
-./build-image.sh            # builds tvm-runtime-rust:0.26
-./build-image.sh --load     # ... and loads it into minikube
-REGISTRY=registry.example.com ./build-image.sh --push
-```
 
 ## Limitations
 
