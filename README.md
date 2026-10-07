@@ -88,8 +88,10 @@ runs on a Raspberry Pi.
 
 ## Use from DigitalHub CORE
 
-Set `RUNTIME_TVM_SERVE=ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0` on CORE to use it for
-every serve, or `image` on a single `tvm+serve` run. CORE:
+Choose `serve_runtime: rust` on a `tvm+serve` run to serve the model with it; the default
+runtime is Go. CORE takes the image from `RUNTIME_TVM_SERVE_RUST` (default
+`ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0`). The tag is multi-arch, so the same image
+serves the amd64, arm64 and arm/v7 nodes. CORE:
 
 - downloads the `tvm-so` Model into `TVM_MODEL_DIR` with an init container;
 - sets `TVM_MODEL_NAME`, `TVM_SERVE_WORKERS` and `TVM_NUM_THREADS` (the run CPUs divided by
