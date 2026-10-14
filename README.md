@@ -5,7 +5,7 @@ The image **`ghcr.io/scc-digitalhub/tvm-runtime-rust`** serves a model compiled 
 port `8080` and gRPC on port `9000`. Inside it runs **`tvm-serve`**, a small Rust server
 with no Python.
 
-It is one of the two serve images of the DigitalHub CORE **`tvm+serve`** task. The default
+It is one of the two serve images for a DigitalHub CORE **`tvm+serve`** run. The default
 one is **DigitalHub TVM Runtime Go**: both behave the same and can be swapped.
 
 ```
@@ -91,7 +91,9 @@ All three platforms remain supported; the target rename removes none of them.
 ## Use from DigitalHub CORE
 
 Set `RUNTIME_TVM_SERVE=ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0` on CORE to use it for
-every serve, or `image` on a single `tvm+serve` run. CORE:
+every serve, or `image` on a single `tvm+serve` run. Configure `model_path`, `served_name`,
+`image`, `replicas`, `workers`, `service_type` and `service_name` in the CORE **Run** step,
+not in the reusable task. The runtime's environment variables and inference API are unchanged. CORE:
 
 - downloads the `tvm-so` Model into `TVM_MODEL_DIR` with an init container;
 - sets `TVM_MODEL_NAME`, `TVM_SERVE_WORKERS` and `TVM_NUM_THREADS` (the run CPUs divided by
