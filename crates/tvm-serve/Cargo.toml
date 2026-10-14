@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 axum = "0.7"
+mime = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
 # gRPC (Open Inference v2 / KServe)
 tonic = "0.12"

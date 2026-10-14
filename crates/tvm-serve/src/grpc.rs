@@ -103,7 +103,7 @@ impl GrpcInferenceService for InferenceService {
         // (typed field). Per KServe, if raw is present at all it wins for every input.
         let use_raw = !req.raw_input_contents.is_empty();
         let mut inputs = Vec::with_capacity(req.inputs.len());
-        for (i, t) in req.inputs.iter().enumerate() {
+        for (i, t) in req.inputs.into_iter().enumerate() {
             let raw = if use_raw {
                 Some(
                     req.raw_input_contents
@@ -114,11 +114,11 @@ impl GrpcInferenceService for InferenceService {
             } else {
                 None
             };
-            let data = tensor_data_from_grpc(&t.datatype, t.contents.as_ref(), raw)
+            let data = tensor_data_from_grpc(&t.datatype, t.contents, raw)
                 .map_err(|e| Status::invalid_argument(format!("input[{i}]: {e}")))?;
             inputs.push(InferInput {
-                name: t.name.clone(),
-                shape: t.shape.clone(),
+                name: t.name,
+                shape: t.shape,
                 data,
             });
         }
@@ -164,7 +164,7 @@ fn serve_err_status(e: crate::worker::ServeErr) -> Status {
 // uint_contents, so those narrow to the declared width; FP16 rejected.
 fn tensor_data_from_grpc(
     datatype: &str,
-    contents: Option<&InferTensorContents>,
+    contents: Option<InferTensorContents>,
     raw: Option<&[u8]>,
 ) -> Result<TensorData, String> {
     if let Some(raw) = raw {
@@ -172,16 +172,16 @@ fn tensor_data_from_grpc(
     }
     let c = contents.ok_or_else(|| "no contents and no raw_input_contents".to_string())?;
     let td = match datatype {
-        "FP32" => TensorData::F32(c.fp32_contents.clone()),
-        "FP64" => TensorData::F64(c.fp64_contents.clone()),
-        "INT8" => TensorData::I8(c.int_contents.iter().map(|&x| x as i8).collect()),
-        "INT16" => TensorData::I16(c.int_contents.iter().map(|&x| x as i16).collect()),
-        "INT32" => TensorData::I32(c.int_contents.clone()),
-        "INT64" => TensorData::I64(c.int64_contents.clone()),
-        "UINT8" => TensorData::U8(c.uint_contents.iter().map(|&x| x as u8).collect()),
-        "UINT16" => TensorData::U16(c.uint_contents.iter().map(|&x| x as u16).collect()),
-        "UINT32" => TensorData::U32(c.uint_contents.clone()),
-        "UINT64" => TensorData::U64(c.uint64_contents.clone()),
+        "FP32" => TensorData::F32(c.fp32_contents),
+        "FP64" => TensorData::F64(c.fp64_contents),
+        "INT8" => TensorData::I8(c.int_contents.into_iter().map(|x| x as i8).collect()),
+        "INT16" => TensorData::I16(c.int_contents.into_iter().map(|x| x as i16).collect()),
+        "INT32" => TensorData::I32(c.int_contents),
+        "INT64" => TensorData::I64(c.int64_contents),
+        "UINT8" => TensorData::U8(c.uint_contents.into_iter().map(|x| x as u8).collect()),
+        "UINT16" => TensorData::U16(c.uint_contents.into_iter().map(|x| x as u16).collect()),
+        "UINT32" => TensorData::U32(c.uint_contents),
+        "UINT64" => TensorData::U64(c.uint64_contents),
         "FP16" => return Err("datatype 'FP16' is not supported (deferred)".to_string()),
         other => return Err(format!("unsupported datatype '{other}'")),
     };

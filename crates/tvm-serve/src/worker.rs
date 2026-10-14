@@ -193,34 +193,27 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
                         return;
                     }
                 };
-                loop {
-                    // Hold the lock only to dequeue, then drop it so a sibling can run.
-                    let job = {
-                        let mut guard = rx.blocking_lock();
-                        guard.blocking_recv()
-                    };
-                    match job {
-                        Some((inputs, reply)) => {
-                            let started = std::time::Instant::now();
-                            let result = run_one(&model, &inputs, &outputs_meta);
-                            match &result {
-                                Ok(outs) => {
-                                    let shapes: Vec<String> = outs
-                                        .iter()
-                                        .map(|o| format!("{}:{:?} {}", o.name, o.shape, o.datatype))
-                                        .collect();
-                                    eprintln!(
-                                        "[tvm-serve] infer done worker={w} run={}ms outputs=[{}]",
-                                        started.elapsed().as_millis(),
-                                        shapes.join(", ")
-                                    );
-                                }
-                                Err(e) => eprintln!("[tvm-serve] infer error worker={w}: {e}"),
-                            }
-                            let _ = reply.send(result);
+                while let Some((inputs, reply)) = {
+                    let mut receiver = rx.blocking_lock();
+                    receiver.blocking_recv()
+                } {
+                    let started = std::time::Instant::now();
+                    let result = run_one(&model, &inputs, &outputs_meta);
+                    match &result {
+                        Ok(outs) => {
+                            let shapes: Vec<String> = outs
+                                .iter()
+                                .map(|o| format!("{}:{:?} {}", o.name, o.shape, o.datatype))
+                                .collect();
+                            eprintln!(
+                                "[tvm-serve] infer done worker={w} run={}ms outputs=[{}]",
+                                started.elapsed().as_millis(),
+                                shapes.join(", ")
+                            );
                         }
-                        None => break,
+                        Err(e) => eprintln!("[tvm-serve] infer error worker={w}: {e}"),
                     }
+                    let _ = reply.send(result);
                 }
             })?;
     }

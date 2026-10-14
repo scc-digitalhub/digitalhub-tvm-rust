@@ -83,8 +83,10 @@ At startup the server refuses the model, with a clear error, unless:
 - the model was compiled for a CPU (LLVM target) of the image architecture;
 - every input and output uses a supported data type.
 
-The image exists for `linux/amd64`, `linux/arm64` and `linux/arm/v7`, so the same command
-runs on a Raspberry Pi.
+Runtime image builds cover `linux/amd64` (Intel/AMD 64-bit), `linux/arm64`
+(ARM 64-bit/AArch64) and `linux/arm/v7` (ARM 32-bit). CORE's `arm32` profile produces
+an ARMv7 hard-float model requiring NEON, for the `linux/arm/v7` runtime.
+All three platforms remain supported; the target rename removes none of them.
 
 ## Use from DigitalHub CORE
 
@@ -96,6 +98,10 @@ every serve, or `image` on a single `tvm+serve` run. CORE:
   the workers);
 - starts the pod on a node with the architecture of the model, where Kubernetes pulls the
   matching variant of the image.
+
+CORE's default init image covers only AMD64 and ARM64. Serving on an ARM32 cluster node
+also requires an ARMv7-compatible init image to download the model. Standalone serving
+with the model mounted into the runtime container does not use this init image.
 
 ## Versions and release
 
@@ -139,6 +145,17 @@ cargo build --release --bin tvm-serve
 ```
 
 Without `TVM_VERSION` and `TVM_GIT_COMMIT` the binary refuses every model.
+
+To build a native image locally (Python 3.11+, Cargo, Docker and binutils required):
+
+```bash
+TVM_HOME=~/tvm/src/tvm-0.26.0 ./build-image.sh
+```
+
+The script verifies the TVM release, submodules and library hashes using
+`scripts/verify-tvm-build.py`. The TVM build must include
+`build/digitalhub-build-provenance.json`; `TVM_BUILD` overrides that build directory.
+The image stays local unless `--push` is explicitly supplied.
 
 ## Limitations
 
