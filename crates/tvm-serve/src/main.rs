@@ -23,8 +23,9 @@ mod worker;
 use std::sync::Arc;
 
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{DefaultBodyLimit, FromRequest, Path, Request, State},
+    http::{header::CONTENT_TYPE, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -195,7 +196,7 @@ async fn model_metadata(
 async fn infer(
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Json(req): Json<InferRequest>,
+    InferJson(req): InferJson,
 ) -> Result<Json<InferResponse>, (StatusCode, String)> {
     do_infer(&state, &name, req).await
 }
@@ -203,9 +204,45 @@ async fn infer(
 async fn infer_versioned(
     State(state): State<AppState>,
     Path((name, _version)): Path<(String, String)>,
-    Json(req): Json<InferRequest>,
+    InferJson(req): InferJson,
 ) -> Result<Json<InferResponse>, (StatusCode, String)> {
     do_infer(&state, &name, req).await
+}
+
+struct InferJson(InferRequest);
+
+#[axum::async_trait]
+impl<S: Send + Sync> FromRequest<S> for InferJson {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let is_json = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()?.parse::<mime::Mime>().ok())
+            .is_some_and(|mime| {
+                mime.type_() == mime::APPLICATION
+                    && (mime.subtype() == mime::JSON || mime.suffix() == Some(mime::JSON))
+            });
+        if !is_json {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Expected application/json".into(),
+            ));
+        }
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(|error| (error.status(), error.body_text()))?;
+        // Axum 0.7's Json extractor does not reject trailing JSON documents.
+        serde_json::from_slice(&bytes).map(Self).map_err(|error| {
+            let status = if error.is_data() {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, error.to_string())
+        })
+    }
 }
 
 // Shared by both /infer routes; awaiting keeps this off the non-Send worker thread.

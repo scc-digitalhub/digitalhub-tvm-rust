@@ -75,7 +75,7 @@ jobs:
             rust_target: aarch64-unknown-linux-gnu
             elf_machine: AArch64
             cross: ""
-          # the armv7l target of runtime-tvm: GitHub has no armv7 runners, so it is cross-compiled
+          # the arm32 target of runtime-tvm: GitHub has no armv7 runners, so it is cross-compiled
           # on amd64 and QEMU only runs the arm/v7 image steps
           - arch: armv7
             runner: ubuntu-24.04

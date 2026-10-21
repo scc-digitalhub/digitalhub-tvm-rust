@@ -18,7 +18,6 @@ pub struct InferRequest {
     pub inputs: Vec<RequestInput>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct RequestInput {
     pub name: String,
@@ -205,7 +204,9 @@ pub fn validate_shape(idx: usize, shape: &[i64], data_len: usize) -> Result<(), 
             .checked_mul(d)
             .ok_or_else(|| format!("input[{idx}]: shape {shape:?} overflows"))?;
     }
-    if numel as usize != data_len {
+    let numel = usize::try_from(numel)
+        .map_err(|_| format!("input[{idx}]: shape {shape:?} exceeds the address space"))?;
+    if numel != data_len {
         return Err(format!(
             "input[{idx}]: shape {shape:?} implies {numel} elements but data has {data_len}"
         ));
