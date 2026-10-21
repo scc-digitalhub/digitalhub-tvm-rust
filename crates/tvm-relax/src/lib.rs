@@ -18,6 +18,7 @@
 //! ```
 
 use serde::Deserialize;
+use std::io::Read;
 use tvm_ffi::collections::array::Array;
 use tvm_ffi::{AnyView, Function, Module, Tensor};
 
@@ -84,6 +85,8 @@ pub struct Metadata {
     #[serde(default)]
     pub target: String,
     #[serde(default)]
+    pub target_triple: String,
+    #[serde(default)]
     pub tvm_version: String,
     #[serde(default)]
     pub tvm_git_commit: String,
@@ -129,7 +132,8 @@ impl Metadata {
             self.tvm_git_commit,
             runtime_commit
         );
-        validate_llvm_target(&self.target, runtime_arch)
+        validate_llvm_target(&self.target, runtime_arch)?;
+        validate_target_triple(&self.target_triple, runtime_arch)
     }
 }
 
@@ -162,23 +166,36 @@ fn validate_llvm_target(target_text: &str, runtime_arch: &str) -> anyhow::Result
         "serve image supports LLVM CPU models, got target kind {:?}",
         target.kind
     );
-    if target.mtriple.is_empty() {
+    validate_target_triple(&target.mtriple, runtime_arch)
+}
+
+fn validate_target_triple(triple: &str, runtime_arch: &str) -> anyhow::Result<()> {
+    if triple.is_empty() {
         return Ok(());
     }
-
-    let target_arch = target
-        .mtriple
+    let (_, abi) = triple
+        .split_once("-linux-")
+        .ok_or_else(|| anyhow::anyhow!("serve image requires a Linux target, got {triple:?}"))?;
+    anyhow::ensure!(
+        abi.starts_with("gnu"),
+        "serve image requires the GNU/glibc ABI, got {triple:?}"
+    );
+    let target_arch = triple
         .split('-')
         .next()
         .and_then(canonical_arch)
-        .ok_or_else(|| anyhow::anyhow!("unsupported LLVM target triple {:?}", target.mtriple))?;
+        .ok_or_else(|| anyhow::anyhow!("unsupported LLVM target triple {triple:?}"))?;
     let runtime_arch = canonical_arch(runtime_arch)
         .ok_or_else(|| anyhow::anyhow!("unsupported serve image architecture {runtime_arch:?}"))?;
     anyhow::ensure!(
         target_arch == runtime_arch,
         "model target triple {:?} is incompatible with runtime architecture {:?}",
-        target.mtriple,
+        triple,
         runtime_arch
+    );
+    anyhow::ensure!(
+        target_arch != "arm" || abi == "gnueabihf",
+        "ARM32 serve image requires the hard-float ABI, got {triple:?}"
     );
     Ok(())
 }
@@ -187,12 +204,41 @@ fn canonical_arch(arch: &str) -> Option<&'static str> {
     match arch.to_ascii_lowercase().as_str() {
         "x86_64" | "amd64" => Some("x86_64"),
         "aarch64" | "arm64" => Some("aarch64"),
-        arch if arch.starts_with("arm") => Some("arm"),
+        "arm" => Some("arm"),
+        arch if arch.starts_with("armv") || arch.starts_with("thumb") => Some("arm"),
         "riscv64" => Some("riscv64"),
-        "powerpc64" | "powerpc64le" | "ppc64le" => Some("powerpc64"),
+        "powerpc64" | "ppc64" => Some("powerpc64"),
+        "powerpc64le" | "ppc64le" => Some("powerpc64le"),
         "s390x" => Some("s390x"),
         _ => None,
     }
+}
+
+/// Check the actual library before loading executable code.
+pub fn validate_library(path: &str, runtime_arch: &str) -> anyhow::Result<()> {
+    let mut header = [0u8; 20];
+    std::fs::File::open(path)?.read_exact(&mut header)?;
+    anyhow::ensure!(&header[..4] == b"\x7fELF", "invalid ELF library {path:?}");
+    let (class, endian, machine) = match canonical_arch(runtime_arch) {
+        Some("x86_64") => (2, 1, 62),
+        Some("aarch64") => (2, 1, 183),
+        Some("arm") => (1, 1, 40),
+        Some("riscv64") => (2, 1, 243),
+        Some("powerpc64le") => (2, 1, 21),
+        Some("powerpc64") => (2, 2, 21),
+        Some("s390x") => (2, 2, 22),
+        _ => anyhow::bail!("unsupported serve image architecture {runtime_arch:?}"),
+    };
+    let actual = match header[5] {
+        1 => u16::from_le_bytes([header[18], header[19]]),
+        2 => u16::from_be_bytes([header[18], header[19]]),
+        _ => anyhow::bail!("invalid ELF byte order"),
+    };
+    anyhow::ensure!(
+        header[4] == class && header[5] == endian && actual == machine,
+        "model ELF class/byte order/machine is incompatible with runtime architecture {runtime_arch:?}"
+    );
+    Ok(())
 }
 
 /// A loaded model ready for inference. `entry` borrows into the VM, which borrows
@@ -242,11 +288,7 @@ impl RelaxModel {
             return Ok(vec![t]);
         }
         let arr: Array<Tensor> = ffi(out.try_into())?;
-        let mut tensors = Vec::with_capacity(arr.len());
-        for i in 0..arr.len() {
-            tensors.push(ffi(arr.get(i))?);
-        }
-        Ok(tensors)
+        (0..arr.len()).map(|i| ffi(arr.get(i))).collect()
     }
 }
 
@@ -331,5 +373,37 @@ mod tests {
         assert!(m.validate_runtime("0.26.0", "c7b458e", "x86_64").is_err());
         m.target = r#"{"kind":"llvm","mtriple":"aarch64-linux-gnu"}"#.to_string();
         assert!(m.validate_runtime("0.26.0", "c7b458e", "x86_64").is_err());
+    }
+
+    #[test]
+    fn target_triple_checks_platform_and_recorded_architecture() {
+        for triple in [
+            "x86_64-apple-darwin",
+            "x86_64-linux-musl",
+            "aarch64-linux-gnu",
+        ] {
+            assert!(validate_target_triple(triple, "x86_64").is_err());
+        }
+        assert!(validate_target_triple("armv7l-unknown-linux-gnueabi", "arm").is_err());
+        assert!(validate_target_triple("armv7l-unknown-linux-gnueabihf", "arm").is_ok());
+        let m: Metadata = serde_json::from_str(
+            r#"{"entry":"main","inputs":[],"outputs":[],"target":"llvm",
+            "target_triple":"aarch64-linux-gnu","tvm_version":"0.26.0","tvm_git_commit":"c7b458e"}"#,
+        ).unwrap();
+        assert!(m.validate_runtime("0.26.0", "c7b458e", "x86_64").is_err());
+    }
+
+    #[test]
+    fn validates_actual_elf_before_loading() {
+        let executable = std::env::current_exe().unwrap();
+        let path = executable.to_str().unwrap();
+        assert!(validate_library(path, std::env::consts::ARCH).is_ok());
+        let foreign = if std::env::consts::ARCH == "x86_64" {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+        assert!(validate_library(path, foreign).is_err());
+        assert!(validate_library("/no/model.so", std::env::consts::ARCH).is_err());
     }
 }

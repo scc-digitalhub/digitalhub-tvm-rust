@@ -80,13 +80,24 @@ At startup the server refuses the model, with a clear error, unless:
 
 - `metadata.json` has the same `tvm_version` and `tvm_git_commit` as the TVM built into the
   image: **compile with the DigitalHub TVM Toolkit of the same release**;
-- the model was compiled for a CPU (LLVM target) of the image architecture;
+- the model was compiled for a Linux GNU/glibc CPU (LLVM target) of the image architecture;
+- `target_triple`, when present, agrees with the runtime, and the actual ELF library
+  has the matching machine, 32/64-bit class and byte order;
 - every input and output uses a supported data type.
 
 Runtime image builds cover `linux/amd64` (Intel/AMD 64-bit), `linux/arm64`
 (ARM 64-bit/AArch64) and `linux/arm/v7` (ARM 32-bit). CORE's `arm32` profile produces
 an ARMv7 hard-float model requiring NEON, for the `linux/arm/v7` runtime.
 All three platforms remain supported; the target rename removes none of them.
+
+Compile profiles are configured in CORE's `runtime-tvm.yaml`; the server does not
+need that file or its profile names. It reads the effective target from the compiled
+model. Older metadata without `target_triple` falls back to `target`; TVM version
+and revision checks still apply. ARM32 requires the hard-float ABI.
+
+These checks do not prove that the CPU supports every instruction selected by
+`mcpu`/`mattr`. Deploy to a matching CPU. A newly configured compile target does not
+automatically add a serving platform; CUDA/GPU inference is not implemented here.
 
 ## Use from DigitalHub CORE
 

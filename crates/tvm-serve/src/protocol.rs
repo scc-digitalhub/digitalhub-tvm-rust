@@ -18,7 +18,6 @@ pub struct InferRequest {
     pub inputs: Vec<RequestInput>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct RequestInput {
     pub name: String,

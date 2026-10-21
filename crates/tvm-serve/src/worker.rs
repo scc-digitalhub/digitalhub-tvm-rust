@@ -165,6 +165,7 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
         }
     }
     let so_path = format!("{model_dir}/model.so");
+    tvm_relax::validate_library(&so_path, std::env::consts::ARCH)?;
     let workers = workers.max(1);
 
     // One job queue, N consumers via a Mutex around the receiver (held only to
