@@ -83,7 +83,7 @@ inference route serves the same loaded model, not a model-version repository.
 At startup the server refuses the model, with a clear error, unless:
 
 - `metadata.json` has the same `tvm_version` and `tvm_git_commit` as the TVM built into the
-  image: **compile with the DigitalHub TVM Toolkit of the same release**;
+  image: compile with a DigitalHub TVM Toolkit image using that TVM version and commit;
 - the model was compiled for a Linux GNU/glibc CPU (LLVM target) of the image architecture;
 - `target_triple`, when present, agrees with the runtime, and the actual ELF library
   has the matching machine, 32/64-bit class and byte order;
@@ -142,21 +142,39 @@ for the Function/Task/Run relationship and target configuration.
 
 ## Versions and release
 
-**The image tag is the git tag, and it is the Apache TVM version**: tag `0.26.0` builds
-`tvm-runtime-rust:0.26.0` on Apache TVM `0.26.0`. Each architecture also gets its own tag:
-`0.26.0-amd64`, `0.26.0-arm64` and `0.26.0-armv7`.
+To publish the latest `main` while keeping Apache TVM `0.26.0`, run the image workflow
+with a separate image tag:
 
-Push a tag `X.Y.Z` (or `X.Y`) and the GitHub Action
-`.github/workflows/tvm-runtime-rust-image.yml` builds the image. For each architecture it:
+```bash
+gh workflow run tvm-runtime-rust-image.yml \
+  --repo scc-digitalhub/digitalhub-tvm-rust --ref main \
+  -f tvm_version=0.26.0 -f image_tag=0.26.0-r1
+```
 
-1. compiles only the TVM runtime (`libtvm_runtime.so`, `libtvm_ffi.so`) of Apache TVM
-   `vX.Y.Z`: natively on amd64 and arm64, cross-compiled for armv7;
+Manual publication accepts only `main`. It builds that run's source commit and publishes
+`tvm-runtime-rust:0.26.0-r1`, plus `-amd64`, `-arm64` and `-armv7` tags. Use a new image
+tag for each release to preserve earlier images. Reusing a tag replaces its images;
+it does not move a Git tag. The image tag can contain at most 122 characters, leaving
+room for the architecture suffix.
+
+The existing Git tag workflow remains available: pushing `0.26.0` publishes image
+`0.26.0` from that tagged commit with Apache TVM `0.26.0`; a tag `X.Y` selects TVM `X.Y.0`.
+Merging into `main` does not publish images automatically.
+
+For each architecture, `.github/workflows/tvm-runtime-rust-image.yml`:
+
+1. compiles only the selected TVM runtime (`libtvm_runtime.so`, `libtvm_ffi.so`):
+   natively on amd64 and arm64, cross-compiled for armv7;
 2. builds `tvm-serve`, embedding the TVM version and commit (armv7 also applies
    `patches/tvm-ffi-rust-32bit.patch`);
 3. builds the image and checks the libraries inside it (`ldd` and SHA-256);
 4. pushes `<tag>-<arch>`.
 
-A last job publishes the multi-architecture tag.
+A last job verifies the source commit and TVM/FFI versions and revisions, then publishes
+the multi-architecture tag from the exact image digests produced by this run.
+`/opt/tvm/provenance.json` records the source repository and commit, image tag, TVM/FFI
+revisions and library hashes. The label `org.digitalhub.source.revision` identifies the
+runtime source commit; the existing TVM/FFI labels retain their meaning.
 
 ## Development
 
