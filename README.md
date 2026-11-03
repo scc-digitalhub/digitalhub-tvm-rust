@@ -23,7 +23,7 @@ dhcli download model -p my-project -n my-model-amd64 -d ./my-model   # model.so 
 docker run --rm -p 8080:8080 -p 9000:9000 \
   -v "$PWD/my-model:/shared/model" \
   -e TVM_MODEL_NAME=my-model \
-  ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r1
+  ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r2
 
 curl http://localhost:8080/v2/models/my-model
 ```
@@ -78,12 +78,12 @@ inference route serves the same loaded model, not a model-version repository.
 - **gRPC clients** need the proto `crates/tvm-serve/proto/grpc_predict_v2.proto` (no
   server reflection).
 
-### Input validation (source changes, not yet released)
+### Input validation
 
-The source validates the model's datatype, rank and static dimensions before
+The runtime validates the model's datatype, rank and static dimensions before
 queuing work for TVM. Negative metadata dimensions are dynamic; request dimensions
 must be nonnegative. Input names still use the positional fallback described above.
-Invalid input returns HTTP `400` / gRPC `INVALID_ARGUMENT`, including wrong element
+Tensor validation failures return HTTP `400` / gRPC `INVALID_ARGUMENT`, including wrong element
 counts, unsupported datatypes, nonfinite values and numeric overflow. Integers must
 fit their declared datatype and cannot be fractional; integral JSON decimal and
 exponent notation such as `1.0` remains accepted. Integer values retain full
@@ -94,9 +94,10 @@ never both. Raw encoding requires exactly one buffer per input; malformed buffer
 are rejected. True execution failures return HTTP `500` / gRPC `INTERNAL` with a
 generic message; detailed native errors remain in the server logs.
 
-These validation fixes require a new runtime build. The published `0.26.0-r1`
-image in the examples does not include them. No model recompilation is needed
-when the TVM version and revision remain unchanged.
+These validation fixes are included in `0.26.0-r2`; the older `0.26.0-r1` image
+does not include them. No model recompilation is needed when the TVM version
+and revision remain unchanged. The `0.26.0-r2` release also handles `SIGTERM`
+and Ctrl-C to stop the server.
 
 ## Which models it serves
 
@@ -124,7 +125,7 @@ automatically add a serving platform; CUDA/GPU inference is not implemented here
 
 ## Use from DigitalHub CORE
 
-Set `RUNTIME_TVM_SERVE=ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r1`
+Set `RUNTIME_TVM_SERVE=ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r2`
 on CORE to use Rust by default, or set `image` on one serve Run. TVM-specific settings belong to
 the **Run**, while the Task supplies common Kubernetes settings. For example:
 
@@ -132,7 +133,7 @@ the **Run**, while the Task supplies common Kubernetes settings. For example:
 kind: tvm+serve:run
 spec:
   task: tvm+serve://my-project/<task-id>
-  image: ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r1
+  image: ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r2
   served_name: my-model
   workers: 1
   resources: {cpu: "4", mem: 2Gi}
@@ -162,17 +163,18 @@ for the Function/Task/Run relationship and target configuration.
 
 ## Versions and release
 
-To publish the latest `main` while keeping Apache TVM `0.26.0`, run the image workflow
-with a separate image tag:
+The current image is `ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r2`, built
+with Apache TVM `0.26.0`. To publish the latest `main` with the same TVM release,
+run the image workflow, replacing `<new-image-tag>` with a new, unused image tag:
 
 ```bash
 gh workflow run tvm-runtime-rust-image.yml \
   --repo scc-digitalhub/digitalhub-tvm-rust --ref main \
-  -f tvm_version=0.26.0 -f image_tag=0.26.0-r1
+  -f tvm_version=0.26.0 -f image_tag='<new-image-tag>'
 ```
 
 Manual publication accepts only `main`. It builds that run's source commit and publishes
-`tvm-runtime-rust:0.26.0-r1`, plus `-amd64`, `-arm64` and `-armv7` tags. Use a new image
+`tvm-runtime-rust:<image_tag>`, plus `-amd64`, `-arm64` and `-armv7` tags. Use a new image
 tag for each release to preserve earlier images. Reusing a tag replaces its images;
 it does not move a Git tag. The image tag can contain at most 122 characters, leaving
 room for the architecture suffix.
@@ -187,8 +189,9 @@ For each architecture, `.github/workflows/tvm-runtime-rust-image.yml`:
    natively on amd64 and arm64, cross-compiled for armv7;
 2. builds `tvm-serve`, embedding the TVM version and commit (armv7 also applies
    `patches/tvm-ffi-rust-32bit.patch`);
-3. builds the image and checks the libraries inside it (`ldd` and SHA-256);
-4. pushes `<tag>-<arch>`.
+3. runs the TVM runtime and inference transport tests on native amd64 and arm64 builds;
+4. builds the image and checks the libraries inside it (`ldd` and SHA-256);
+5. pushes `<tag>-<arch>`.
 
 A last job verifies the source commit and TVM/FFI versions and revisions, then publishes
 the multi-architecture tag from the exact image digests produced by this run.
