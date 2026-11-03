@@ -43,10 +43,168 @@ type Reply = oneshot::Sender<Result<Vec<InferOutput>, String>>;
 type Job = (Vec<InferInput>, Reply);
 
 // Coarse error kind so REST and gRPC each map to their own status from `serve_infer`.
+#[derive(Debug)]
 pub enum ServeErr {
     NotFound(String),
     BadRequest(String),
     Internal(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle() -> Handle {
+        let (tx, _) = mpsc::channel(1);
+        Handle {
+            tx,
+            model_name: "test".into(),
+            metadata: serde_json::from_value(serde_json::json!({
+                "entry": "main", "inputs": [{"name": "x", "shape": [1, 2], "dtype": "float32"}],
+                "outputs": []
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_signature_is_a_client_error() {
+        for input in [
+            InferInput {
+                name: "x".into(),
+                shape: vec![1, 2],
+                data: TensorData::F32(vec![1.]),
+            },
+            InferInput {
+                name: "x".into(),
+                shape: vec![-1, 2],
+                data: TensorData::F32(vec![1., 2.]),
+            },
+            InferInput {
+                name: "x".into(),
+                shape: vec![i64::MAX, 2],
+                data: TensorData::F32(vec![1., 2.]),
+            },
+            InferInput {
+                name: "x".into(),
+                shape: vec![1, 2],
+                data: TensorData::F32(vec![f32::NAN, f32::INFINITY]),
+            },
+            InferInput {
+                name: "x".into(),
+                shape: vec![2, 1],
+                data: TensorData::F32(vec![1., 2.]),
+            },
+            InferInput {
+                name: "x".into(),
+                shape: vec![2],
+                data: TensorData::F32(vec![1., 2.]),
+            },
+            InferInput {
+                name: "x".into(),
+                shape: vec![1, 2],
+                data: TensorData::I32(vec![1, 2]),
+            },
+        ] {
+            assert!(matches!(
+                handle().serve_infer("test", vec![input]).await,
+                Err(ServeErr::BadRequest(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_arity_is_rejected_before_dispatch() {
+        for count in [0, 2] {
+            let inputs = (0..count)
+                .map(|_| InferInput {
+                    name: "x".into(),
+                    shape: vec![1, 2],
+                    data: TensorData::F32(vec![1., 2.]),
+                })
+                .collect();
+            assert!(matches!(
+                handle().serve_infer("test", inputs).await,
+                Err(ServeErr::BadRequest(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn nonfinite_fp64_values_are_rejected_before_dispatch() {
+        let mut handle = handle();
+        handle.metadata.inputs[0].dtype = "float64".into();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let input = InferInput {
+                name: "x".into(),
+                shape: vec![1, 2],
+                data: TensorData::F64(vec![1., value]),
+            };
+            assert!(matches!(
+                handle.serve_infer("test", vec![input]).await,
+                Err(ServeErr::BadRequest(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_inputs_reorder_only_for_an_exact_name_match() {
+        for first_name in ["x", "", "unknown", "y"] {
+            let mut handle = handle();
+            handle.metadata.inputs = serde_json::from_value(serde_json::json!([
+                {"name": "x", "shape": [1], "dtype": "float32"},
+                {"name": "y", "shape": [2], "dtype": "int32"}
+            ]))
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle.tx = tx;
+            let worker = tokio::spawn(async move {
+                let (inputs, reply) = rx.recv().await.unwrap();
+                assert_eq!(inputs[0].shape, vec![1]);
+                assert_eq!(inputs[1].shape, vec![2]);
+                reply.send(Ok(vec![])).ok().unwrap();
+            });
+            let x = InferInput {
+                name: first_name.into(),
+                shape: vec![1],
+                data: TensorData::F32(vec![1.]),
+            };
+            let y = InferInput {
+                name: "y".into(),
+                shape: vec![2],
+                data: TensorData::I32(vec![2, 3]),
+            };
+            let inputs = if first_name == "x" {
+                vec![y, x]
+            } else {
+                vec![x, y]
+            };
+            assert!(handle.serve_infer("test", inputs).await.is_ok());
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_positional_and_dynamic_inputs_reach_worker() {
+        for name in ["x", "", "unknown"] {
+            let mut handle = handle();
+            handle.metadata.inputs[0].shape[0] = -1;
+            let (tx, mut rx) = mpsc::channel(1);
+            handle.tx = tx;
+            let worker = tokio::spawn(async move {
+                let (inputs, reply) = rx.recv().await.unwrap();
+                assert_eq!(inputs[0].shape, vec![1, 2]);
+                reply.send(Ok(vec![])).ok().unwrap();
+            });
+            let input = InferInput {
+                name: name.into(),
+                shape: vec![1, 2],
+                data: TensorData::F32(vec![1., 2.]),
+            };
+            assert!(handle.serve_infer("test", vec![input]).await.is_ok());
+            worker.await.unwrap();
+        }
+    }
 }
 
 pub struct Handle {
@@ -124,6 +282,37 @@ impl Handle {
         for (idx, i) in inputs.iter().enumerate() {
             crate::protocol::validate_shape(idx, &i.shape, i.data.len())
                 .map_err(ServeErr::BadRequest)?;
+            let finite = match &i.data {
+                TensorData::F32(values) => values.iter().all(|v| v.is_finite()),
+                TensorData::F64(values) => values.iter().all(|v| v.is_finite()),
+                _ => true,
+            };
+            if !finite {
+                return Err(ServeErr::BadRequest(format!(
+                    "input[{idx}]: values must be finite"
+                )));
+            }
+            let spec = &self.metadata.inputs[idx];
+            let datatype = crate::protocol::tvm_to_v2_dtype(&spec.dtype);
+            if i.data.datatype() != datatype {
+                return Err(ServeErr::BadRequest(format!(
+                    "input '{}': expected datatype {datatype}, got {}",
+                    spec.name,
+                    i.data.datatype()
+                )));
+            }
+            if i.shape.len() != spec.shape.len()
+                || spec
+                    .shape
+                    .iter()
+                    .zip(&i.shape)
+                    .any(|(&expected, &actual)| expected >= 0 && expected != actual)
+            {
+                return Err(ServeErr::BadRequest(format!(
+                    "input '{}': expected shape {:?}, got {:?}",
+                    spec.name, spec.shape, i.shape
+                )));
+            }
         }
         self.infer(inputs).await.map_err(ServeErr::Internal)
     }

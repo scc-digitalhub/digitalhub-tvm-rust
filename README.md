@@ -23,7 +23,7 @@ dhcli download model -p my-project -n my-model-amd64 -d ./my-model   # model.so 
 docker run --rm -p 8080:8080 -p 9000:9000 \
   -v "$PWD/my-model:/shared/model" \
   -e TVM_MODEL_NAME=my-model \
-  ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0
+  ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r1
 
 curl http://localhost:8080/v2/models/my-model
 ```
@@ -78,6 +78,26 @@ inference route serves the same loaded model, not a model-version repository.
 - **gRPC clients** need the proto `crates/tvm-serve/proto/grpc_predict_v2.proto` (no
   server reflection).
 
+### Input validation (source changes, not yet released)
+
+The source validates the model's datatype, rank and static dimensions before
+queuing work for TVM. Negative metadata dimensions are dynamic; request dimensions
+must be nonnegative. Input names still use the positional fallback described above.
+Invalid input returns HTTP `400` / gRPC `INVALID_ARGUMENT`, including wrong element
+counts, unsupported datatypes, nonfinite values and numeric overflow. Integers must
+fit their declared datatype and cannot be fractional; integral JSON decimal and
+exponent notation such as `1.0` remains accepted. Integer values retain full
+`INT64`/`UINT64` precision without floating-point rounding during validation.
+
+gRPC accepts either typed `contents` or little-endian `raw_input_contents`,
+never both. Raw encoding requires exactly one buffer per input; malformed buffers
+are rejected. True execution failures return HTTP `500` / gRPC `INTERNAL` with a
+generic message; detailed native errors remain in the server logs.
+
+These validation fixes require a new runtime build. The published `0.26.0-r1`
+image in the examples does not include them. No model recompilation is needed
+when the TVM version and revision remain unchanged.
+
 ## Which models it serves
 
 At startup the server refuses the model, with a clear error, unless:
@@ -104,7 +124,7 @@ automatically add a serving platform; CUDA/GPU inference is not implemented here
 
 ## Use from DigitalHub CORE
 
-Set `RUNTIME_TVM_SERVE=ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0`
+Set `RUNTIME_TVM_SERVE=ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r1`
 on CORE to use Rust by default, or set `image` on one serve Run. TVM-specific settings belong to
 the **Run**, while the Task supplies common Kubernetes settings. For example:
 
@@ -112,7 +132,7 @@ the **Run**, while the Task supplies common Kubernetes settings. For example:
 kind: tvm+serve:run
 spec:
   task: tvm+serve://my-project/<task-id>
-  image: ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0
+  image: ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r1
   served_name: my-model
   workers: 1
   resources: {cpu: "4", mem: 2Gi}

@@ -45,6 +45,21 @@ pub enum TensorData {
 }
 
 impl TensorData {
+    pub fn datatype(&self) -> &'static str {
+        match self {
+            Self::F32(_) => "FP32",
+            Self::F64(_) => "FP64",
+            Self::I8(_) => "INT8",
+            Self::I16(_) => "INT16",
+            Self::I32(_) => "INT32",
+            Self::I64(_) => "INT64",
+            Self::U8(_) => "UINT8",
+            Self::U16(_) => "UINT16",
+            Self::U32(_) => "UINT32",
+            Self::U64(_) => "UINT64",
+        }
+    }
+
     /// Element count.
     pub fn len(&self) -> usize {
         match self {
@@ -62,21 +77,35 @@ impl TensorData {
     }
 
     /// Parse a v2 input's `data` (flat or nested numbers) into a typed buffer per
-    /// `datatype`. Integers read directly (INT64 keeps full precision) with a float
-    /// fallback so `1.0` is accepted in an integer slot; FP16 is rejected.
+    /// `datatype`. Integers keep full precision, including integral decimal and
+    /// exponent notation such as `1.0`; FP16 is rejected.
     pub fn from_json(v: &serde_json::Value, datatype: &str) -> Result<TensorData, String> {
         let mut nums: Vec<&serde_json::Number> = Vec::new();
         collect_numbers(v, &mut nums)?;
         let td = match datatype {
-            "FP32" => TensorData::F32(map_nums(&nums, |n| n.as_f64().map(|x| x as f32))?),
+            "FP32" => TensorData::F32(map_nums(&nums, |n| {
+                n.as_f64().map(|x| x as f32).filter(|x| x.is_finite())
+            })?),
             "FP64" => TensorData::F64(map_nums(&nums, |n| n.as_f64())?),
-            "INT8" => TensorData::I8(map_nums(&nums, |n| as_i64(n).map(|x| x as i8))?),
-            "INT16" => TensorData::I16(map_nums(&nums, |n| as_i64(n).map(|x| x as i16))?),
-            "INT32" => TensorData::I32(map_nums(&nums, |n| as_i64(n).map(|x| x as i32))?),
+            "INT8" => TensorData::I8(map_nums(&nums, |n| {
+                as_i64(n).and_then(|x| i8::try_from(x).ok())
+            })?),
+            "INT16" => TensorData::I16(map_nums(&nums, |n| {
+                as_i64(n).and_then(|x| i16::try_from(x).ok())
+            })?),
+            "INT32" => TensorData::I32(map_nums(&nums, |n| {
+                as_i64(n).and_then(|x| i32::try_from(x).ok())
+            })?),
             "INT64" => TensorData::I64(map_nums(&nums, as_i64)?),
-            "UINT8" => TensorData::U8(map_nums(&nums, |n| as_u64(n).map(|x| x as u8))?),
-            "UINT16" => TensorData::U16(map_nums(&nums, |n| as_u64(n).map(|x| x as u16))?),
-            "UINT32" => TensorData::U32(map_nums(&nums, |n| as_u64(n).map(|x| x as u32))?),
+            "UINT8" => TensorData::U8(map_nums(&nums, |n| {
+                as_u64(n).and_then(|x| u8::try_from(x).ok())
+            })?),
+            "UINT16" => TensorData::U16(map_nums(&nums, |n| {
+                as_u64(n).and_then(|x| u16::try_from(x).ok())
+            })?),
+            "UINT32" => TensorData::U32(map_nums(&nums, |n| {
+                as_u64(n).and_then(|x| u32::try_from(x).ok())
+            })?),
             "UINT64" => TensorData::U64(map_nums(&nums, as_u64)?),
             "FP16" => {
                 return Err(
@@ -105,13 +134,39 @@ impl TensorData {
     }
 }
 
-// Float fallback: accepts `1.0` in an integer slot; ints keep full precision.
+// Accept integral decimal/exponent notation without rounding through f64.
 fn as_i64(n: &serde_json::Number) -> Option<i64> {
-    n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))
+    n.as_i64().or_else(|| i64::try_from(exact_integer(n)?).ok())
 }
 
 fn as_u64(n: &serde_json::Number) -> Option<u64> {
-    n.as_u64().or_else(|| n.as_f64().map(|f| f as u64))
+    n.as_u64().or_else(|| u64::try_from(exact_integer(n)?).ok())
+}
+
+fn exact_integer(n: &serde_json::Number) -> Option<i128> {
+    let text = n.as_str();
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let significant = digits.trim_end_matches('0');
+    let shift = exponent
+        .parse::<i64>()
+        .ok()?
+        .checked_sub(i64::try_from(fraction.len()).ok()?)?
+        .checked_add(i64::try_from(digits.len() - significant.len()).ok()?)?;
+    // A negative shift leaves a fractional part. More than 20 digits cannot fit
+    // any supported integer dtype; bound the exponent before calculating it.
+    if shift < 0 || shift > 20 || significant.len() > 20 - shift as usize {
+        return None;
+    }
+    let value = significant.parse::<i128>().ok()? * 10_i128.pow(shift as u32);
+    Some(if negative { -value } else { value })
 }
 
 fn collect_numbers<'a>(
@@ -228,5 +283,79 @@ pub fn tvm_to_v2_dtype(dt: &str) -> &'static str {
         "uint32" => "UINT32",
         "uint64" => "UINT64",
         _ => "FP32",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_numeric_overflow_and_fractional_integers() {
+        for (dtype, value) in [
+            ("INT8", "128"),
+            ("INT8", "-129"),
+            ("UINT8", "256"),
+            ("UINT8", "-1"),
+            ("INT16", "32768"),
+            ("UINT16", "65536"),
+            ("INT32", "2147483648"),
+            ("UINT32", "4294967296"),
+            ("INT64", "9223372036854775808"),
+            ("INT64", "-9223372036854775809"),
+            ("INT64", "-9223372036854775809.0"),
+            ("UINT64", "18446744073709551616"),
+            ("INT64", "9007199254740991.5"),
+            ("UINT64", "1.00000000000000001"),
+            ("INT8", "1e-400"),
+            ("INT8", "1.5"),
+            ("UINT8", "1.5"),
+            ("FP32", "1e100"),
+            ("FP64", "1e400"),
+        ] {
+            let json = serde_json::from_str(&format!("[{value}]")).unwrap();
+            assert!(
+                TensorData::from_json(&json, dtype).is_err(),
+                "{dtype} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_integer_boundaries_and_accepts_integral_float_notation() {
+        for (dtype, value) in [
+            ("INT8", "-128"),
+            ("INT8", "127"),
+            ("UINT8", "255"),
+            ("INT64", "-9223372036854775808"),
+            ("INT64", "9223372036854775807"),
+            ("UINT64", "18446744073709551615"),
+            ("INT64", "9223372036854775807.0"),
+            ("UINT64", "18446744073709551615.0"),
+            ("INT8", "1.0"),
+            ("UINT8", "1e1"),
+            ("INT8", "-1.20e2"),
+            ("UINT8", "1000e-1"),
+            ("UINT8", "0e9999999999999999999999999999"),
+        ] {
+            let json: serde_json::Value = serde_json::from_str(&format!("[{value}]")).unwrap();
+            assert!(
+                TensorData::from_json(&json, dtype).is_ok(),
+                "{dtype} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_decimal_notation_preserves_all_digits() {
+        for (dtype, input, expected) in [
+            ("INT64", "-9223372036854775808.0", "-9223372036854775808"),
+            ("INT64", "9223372036854775807.0", "9223372036854775807"),
+            ("UINT64", "1.8446744073709551615e19", "18446744073709551615"),
+        ] {
+            let json = serde_json::from_str(&format!("[{input}]")).unwrap();
+            let actual = TensorData::from_json(&json, dtype).unwrap().to_json();
+            assert_eq!(actual.to_string(), format!("[{expected}]"));
+        }
     }
 }
