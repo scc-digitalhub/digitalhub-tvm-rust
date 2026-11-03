@@ -218,6 +218,15 @@ jobs:
             exit 1
           fi
 
+      - name: Test native TVM runtime and inference transports
+        if: matrix.cross == ''
+        run: |
+          PATH="$GITHUB_WORKSPACE/scripts:$PATH" \
+            TVM_BUILD_DIR="$TVM_BUILD" \
+            TVM_FFI_LIBDIR="$TVM_BUILD/lib" \
+            LD_LIBRARY_PATH="$TVM_BUILD/lib" \
+            cargo test --locked --release --target "$RUST_TARGET" -p tvm-relax -p tvm-serve
+
       - name: Stage the image build context
         run: |
           # same layout build-image.sh produces: lib/, tvm-serve and provenance.json at the root

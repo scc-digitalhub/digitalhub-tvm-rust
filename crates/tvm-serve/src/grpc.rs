@@ -100,8 +100,13 @@ impl GrpcInferenceService for InferenceService {
         let req = r.into_inner();
 
         // Two accepted encodings: raw_input_contents (LE bytes) or inputs[i].contents
-        // (typed field). Per KServe, if raw is present at all it wins for every input.
+        // (typed field). The two encodings cannot be mixed in one request.
         let use_raw = !req.raw_input_contents.is_empty();
+        if use_raw && req.raw_input_contents.len() != req.inputs.len() {
+            return Err(Status::invalid_argument(
+                "raw_input_contents must contain one entry per input",
+            ));
+        }
         let mut inputs = Vec::with_capacity(req.inputs.len());
         for (i, t) in req.inputs.into_iter().enumerate() {
             let raw = if use_raw {
@@ -155,11 +160,95 @@ fn serve_err_status(e: crate::worker::ServeErr) -> Status {
     match e {
         ServeErr::NotFound(m) => Status::not_found(m),
         ServeErr::BadRequest(m) => Status::invalid_argument(m),
-        ServeErr::Internal(m) => Status::internal(m),
+        ServeErr::Internal(m) => {
+            eprintln!("[tvm-serve] internal error: {m}");
+            Status::internal("inference failed")
+        }
     }
 }
 
-// Decode one gRPC input tensor. Raw LE bytes win if present, else the typed
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_encodings_are_rejected() {
+        assert!(
+            tensor_data_from_grpc("FP32", Some(InferTensorContents::default()), Some(&[0; 4]))
+                .is_err()
+        );
+        assert!(tensor_data_from_grpc("FP32", None, Some(&[0; 3])).is_err());
+        assert!(tensor_data_from_grpc("FP32", None, None).is_err());
+        for (dtype, signed, unsigned) in [
+            ("INT8", 128, 0),
+            ("INT8", -129, 0),
+            ("INT16", 32768, 0),
+            ("UINT8", 0, 256),
+            ("UINT16", 0, 65536),
+        ] {
+            let contents = InferTensorContents {
+                int_contents: vec![signed],
+                uint_contents: vec![unsigned],
+                ..Default::default()
+            };
+            assert!(
+                tensor_data_from_grpc(dtype, Some(contents), None).is_err(),
+                "{dtype}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_and_typed_contents_preserve_int64_precision() {
+        for (dtype, contents, raw) in [
+            (
+                "INT64",
+                InferTensorContents {
+                    int64_contents: vec![i64::MAX],
+                    ..Default::default()
+                },
+                i64::MAX.to_le_bytes(),
+            ),
+            (
+                "UINT64",
+                InferTensorContents {
+                    uint64_contents: vec![u64::MAX],
+                    ..Default::default()
+                },
+                u64::MAX.to_le_bytes(),
+            ),
+        ] {
+            let typed = tensor_data_from_grpc(dtype, Some(contents), None)
+                .unwrap()
+                .to_json();
+            let raw = tensor_data_from_grpc(dtype, None, Some(&raw))
+                .unwrap()
+                .to_json();
+            assert_eq!(typed, raw);
+        }
+    }
+
+    #[test]
+    fn errors_map_to_standard_status_codes() {
+        for (error, expected) in [
+            (
+                crate::worker::ServeErr::BadRequest("bad input".into()),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                crate::worker::ServeErr::NotFound("unknown model".into()),
+                tonic::Code::NotFound,
+            ),
+        ] {
+            assert_eq!(serve_err_status(error).code(), expected);
+        }
+        let error = serve_err_status(crate::worker::ServeErr::Internal("native traceback".into()));
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert_eq!(error.message(), "inference failed");
+    }
+}
+
+// Decode one gRPC input tensor from either raw LE bytes or the typed
 // `contents`. gRPC packs INT8/16/32 in int_contents and UINT8/16/32 in
 // uint_contents, so those narrow to the declared width; FP16 rejected.
 fn tensor_data_from_grpc(
@@ -167,6 +256,9 @@ fn tensor_data_from_grpc(
     contents: Option<InferTensorContents>,
     raw: Option<&[u8]>,
 ) -> Result<TensorData, String> {
+    if raw.is_some() && contents.is_some() {
+        return Err("contents and raw_input_contents are mutually exclusive".into());
+    }
     if let Some(raw) = raw {
         return tensor_data_from_raw(datatype, raw);
     }
@@ -174,12 +266,36 @@ fn tensor_data_from_grpc(
     let td = match datatype {
         "FP32" => TensorData::F32(c.fp32_contents),
         "FP64" => TensorData::F64(c.fp64_contents),
-        "INT8" => TensorData::I8(c.int_contents.into_iter().map(|x| x as i8).collect()),
-        "INT16" => TensorData::I16(c.int_contents.into_iter().map(|x| x as i16).collect()),
+        "INT8" => TensorData::I8(
+            c.int_contents
+                .into_iter()
+                .map(i8::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?,
+        ),
+        "INT16" => TensorData::I16(
+            c.int_contents
+                .into_iter()
+                .map(i16::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?,
+        ),
         "INT32" => TensorData::I32(c.int_contents),
         "INT64" => TensorData::I64(c.int64_contents),
-        "UINT8" => TensorData::U8(c.uint_contents.into_iter().map(|x| x as u8).collect()),
-        "UINT16" => TensorData::U16(c.uint_contents.into_iter().map(|x| x as u16).collect()),
+        "UINT8" => TensorData::U8(
+            c.uint_contents
+                .into_iter()
+                .map(u8::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?,
+        ),
+        "UINT16" => TensorData::U16(
+            c.uint_contents
+                .into_iter()
+                .map(u16::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?,
+        ),
         "UINT32" => TensorData::U32(c.uint_contents),
         "UINT64" => TensorData::U64(c.uint64_contents),
         "FP16" => return Err("datatype 'FP16' is not supported (deferred)".to_string()),
@@ -203,7 +319,9 @@ fn tensor_data_from_raw(datatype: &str, raw: &[u8]) -> Result<TensorData, String
         }};
     }
     match datatype {
-        "FP32" => from_le!(4, TensorData::F32, |c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        "FP32" => from_le!(4, TensorData::F32, |c| f32::from_le_bytes([
+            c[0], c[1], c[2], c[3]
+        ])),
         "FP64" => {
             from_le!(8, TensorData::F64, |c| f64::from_le_bytes([
                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
@@ -211,7 +329,9 @@ fn tensor_data_from_raw(datatype: &str, raw: &[u8]) -> Result<TensorData, String
         }
         "INT8" => Ok(TensorData::I8(raw.iter().map(|&b| b as i8).collect())),
         "INT16" => from_le!(2, TensorData::I16, |c| i16::from_le_bytes([c[0], c[1]])),
-        "INT32" => from_le!(4, TensorData::I32, |c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        "INT32" => from_le!(4, TensorData::I32, |c| i32::from_le_bytes([
+            c[0], c[1], c[2], c[3]
+        ])),
         "INT64" => {
             from_le!(8, TensorData::I64, |c| i64::from_le_bytes([
                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
@@ -219,7 +339,9 @@ fn tensor_data_from_raw(datatype: &str, raw: &[u8]) -> Result<TensorData, String
         }
         "UINT8" => Ok(TensorData::U8(raw.to_vec())),
         "UINT16" => from_le!(2, TensorData::U16, |c| u16::from_le_bytes([c[0], c[1]])),
-        "UINT32" => from_le!(4, TensorData::U32, |c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        "UINT32" => from_le!(4, TensorData::U32, |c| u32::from_le_bytes([
+            c[0], c[1], c[2], c[3]
+        ])),
         "UINT64" => {
             from_le!(8, TensorData::U64, |c| u64::from_le_bytes([
                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]

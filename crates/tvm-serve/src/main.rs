@@ -111,17 +111,30 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("[tvm-serve] REST on http://{rest_addr}  ·  gRPC on {grpc_addr}");
 
-    // First branch to resolve tears the process down (fatal error or Ctrl-C).
+    // First branch to resolve tears the process down (fatal error or shutdown signal).
     tokio::select! {
         res = axum::serve(listener, app) => res?,
         res = grpc_server => res?,
-        _ = shutdown_signal() => eprintln!("[tvm-serve] shutdown."),
+        res = shutdown_signal() => {
+            res?;
+            eprintln!("[tvm-serve] shutdown.");
+        },
     }
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 fn env_u16(key: &str, default: u16) -> u16 {
@@ -293,13 +306,35 @@ fn serve_err_http(e: ServeErr) -> (StatusCode, String) {
     match e {
         ServeErr::NotFound(m) => (StatusCode::NOT_FOUND, m),
         ServeErr::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-        ServeErr::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        ServeErr::Internal(m) => {
+            eprintln!("[tvm-serve] internal error: {m}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "inference failed".into())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_map_to_standard_http_status_codes() {
+        for (error, expected) in [
+            (
+                ServeErr::BadRequest("bad input".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServeErr::NotFound("unknown model".into()),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            assert_eq!(serve_err_http(error).0, expected);
+        }
+        let error = serve_err_http(ServeErr::Internal("native traceback".into()));
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.1, "inference failed");
+    }
 
     fn spec(dtype: &str, scale: Vec<f64>, zero_point: Vec<i64>) -> tvm_relax::TensorSpec {
         tvm_relax::TensorSpec {
@@ -318,10 +353,15 @@ mod tests {
     fn quantized_tensor_publishes_parameters() {
         let m = to_tensor_metadata(&spec("int8", vec![0.003921568859368563], vec![-128]));
         assert_eq!(m.datatype, "INT8");
-        let p = m.parameters.expect("a quantized tensor must publish its parameters");
+        let p = m
+            .parameters
+            .expect("a quantized tensor must publish its parameters");
         assert_eq!(p["scale"][0], 0.003921568859368563);
         assert_eq!(p["zero_point"][0], -128);
-        assert!(p.get("quantized_dimension").is_none(), "per-tensor quantization: no axis");
+        assert!(
+            p.get("quantized_dimension").is_none(),
+            "per-tensor quantization: no axis"
+        );
     }
 
     /// Per-axis quantization also carries the axis the entries are indexed by.
