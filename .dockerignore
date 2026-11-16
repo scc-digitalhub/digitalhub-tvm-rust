@@ -6,3 +6,5 @@ Cargo.lock
 *.sh
 *.md
 .git
+.cuda-build
+.tvm-ffi-rust
