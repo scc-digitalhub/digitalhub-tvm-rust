@@ -1,446 +1,112 @@
-# Publishes AMD64, ARM64 and ARMv7 images from release tags or manually from main.
-name: tvm-runtime-rust image
+# Project release tags select the code; TVM and CUDA versions come from release-images.json.
+name: tvm-runtime-rust release
 
 on:
   push:
     tags:
-      - "[0-9]+.[0-9]+"
       - "[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
     inputs:
-      tvm_version:
-        description: Apache TVM release (X.Y.Z)
-        required: true
-        default: "0.26.0"
+      release_tag:
+        description: Project release tag, for example 0.16.1
         type: string
-      image_tag:
-        description: Image tag to publish (for example 0.26.0-r1)
         required: true
+      publish:
+        description: Publish images from the exact release tag
+        type: boolean
+        default: false
+      manifest_run_id:
+        description: Optional previous run ID to recover manifests without rebuilding
         type: string
+        default: ''
 
 concurrency:
-  group: tvm-runtime-rust-${{ inputs.image_tag || github.ref_name }}
+  group: tvm-runtime-rust-release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
   contents: read
   packages: write
-
-env:
-  IMAGE: ghcr.io/scc-digitalhub/tvm-runtime-rust
-  # shown by GitHub Packages; source links the package to this repository
-  DESCRIPTION: "Rust OpenInference v2 server (REST and gRPC) for TVM-compiled models, used by DigitalHub tvm+serve"
-
-defaults:
-  run:
-    shell: bash
+  actions: read
 
 jobs:
-  version:
+  release:
     runs-on: ubuntu-24.04
     outputs:
-      tvm: ${{ steps.v.outputs.tvm }}
-      tag: ${{ steps.v.outputs.tag }}
-      ffi: ${{ steps.v.outputs.ffi }}
+      release: ${{ steps.resolve.outputs.release }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      cpu_tag: ${{ steps.resolve.outputs.cpu_tag }}
+      cuda_tag: ${{ steps.resolve.outputs.cuda_tag }}
+      tvm_version: ${{ steps.resolve.outputs.tvm_version }}
+      ffi_version: ${{ steps.resolve.outputs.ffi_version }}
+      tvm_commit: ${{ steps.resolve.outputs.tvm_commit }}
+      ffi_commit: ${{ steps.resolve.outputs.ffi_commit }}
+      cuda_version: ${{ steps.resolve.outputs.cuda_version }}
     steps:
-      - name: Resolve TVM version and image tag
-        id: v
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Resolve source tag and dependency versions
+        id: resolve
         env:
-          REQUESTED_TVM_VERSION: ${{ inputs.tvm_version }}
-          REQUESTED_IMAGE_TAG: ${{ inputs.image_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          MANIFEST_RUN_ID: ${{ inputs.manifest_run_id }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            if [ "$GITHUB_REF" != refs/heads/main ]; then
-              echo "::error::manual publication must run from main"
-              exit 1
-            fi
-            tvm="$REQUESTED_TVM_VERSION"
-            tag="$REQUESTED_IMAGE_TAG"
-          else
-            if [[ ! "$GITHUB_REF" = refs/tags/* || ! "$GITHUB_REF_NAME" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]]; then
-              echo "::error::run on a tag X.Y or X.Y.Z, got '$GITHUB_REF_NAME'"
-              exit 1
-            fi
-            tvm="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[4]:-0}"
-            tag="$GITHUB_REF_NAME"
-          fi
-          if [[ ! "$tvm" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::TVM version must be X.Y.Z"
+          if [[ -n "$MANIFEST_RUN_ID" && ! "$MANIFEST_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid recovery run ID" >&2
             exit 1
           fi
-          if [[ ! "$tag" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,121}$ ]]; then
-            echo "::error::invalid image tag (maximum 122 characters, before architecture suffix)"
-            exit 1
-          fi
-          if [[ "${tag,,}" == *cuda* ]]; then
-            echo "::error::CPU publication cannot use a CUDA image tag"
-            exit 1
-          fi
-          # apache-tvm-ffi release bundled with each TVM version (keep in step with the TVM toolkit image)
-          case "$tvm" in
-            0.24.*) ffi=0.1.11 ;;
-            0.25.*) ffi=0.1.12 ;;
-            0.26.*) ffi=0.1.13.post2 ;;
-            *) echo "::error::no apache-tvm-ffi mapping for TVM $tvm"; exit 1 ;;
-          esac
-          {
-            echo "tvm=$tvm"
-            echo "tag=$tag"
-            echo "ffi=$ffi"
-          } >> "$GITHUB_OUTPUT"
+          args=()
+          if [ "$PUBLISH" = true ]; then args+=(--publish); fi
+          python3 scripts/release-images.py resolve --release "$RELEASE_TAG" "${args[@]}"
 
-  build:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-            rust_target: x86_64-unknown-linux-gnu
-            elf_machine: Advanced Micro Devices X86-64
-            cross: ""
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            rust_target: aarch64-unknown-linux-gnu
-            elf_machine: AArch64
-            cross: ""
-          # the arm32 target of runtime-tvm: GitHub has no armv7 runners, so it is cross-compiled
-          # on amd64 and QEMU only runs the arm/v7 image steps
-          - arch: armv7
-            runner: ubuntu-24.04
-            platform: linux/arm/v7
-            rust_target: armv7-unknown-linux-gnueabihf
-            elf_machine: ARM
-            cross: arm-linux-gnueabihf
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    env:
-      TVM_VERSION: ${{ needs.version.outputs.tvm }}
-      TVM_FFI_VERSION: ${{ needs.version.outputs.ffi }}
-      IMAGE_TAG: ${{ needs.version.outputs.tag }}
-      REF: ghcr.io/scc-digitalhub/tvm-runtime-rust:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
-      ARCH: ${{ matrix.arch }}
-      PLATFORM: ${{ matrix.platform }}
-      RUST_TARGET: ${{ matrix.rust_target }}
-      CROSS: ${{ matrix.cross }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
+        if: (github.event_name == 'push' || inputs.publish) && (inputs.manifest_run_id || '') == ''
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - if: matrix.cross != ''
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
-
-      - name: Install build tools
+      - name: Refuse existing image tags before building
+        if: (github.event_name == 'push' || inputs.publish) && (inputs.manifest_run_id || '') == ''
+        env:
+          CPU_TAG: ${{ steps.resolve.outputs.cpu_tag }}
+          CUDA_TAG: ${{ steps.resolve.outputs.cuda_tag }}
         run: |
-          packages="build-essential ninja-build file rsync"
-          if [ -n "$CROSS" ]; then
-            packages="$packages gcc-$CROSS g++-$CROSS binutils-$CROSS"
-          fi
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends $packages
-          echo "TOOL_PREFIX=${CROSS:+$CROSS-}" >> "$GITHUB_ENV"
-
-      - name: Compile the TVM runtime
-        run: |
-          src="$RUNNER_TEMP/tvm"
-          git clone --depth 1 --branch "v$TVM_VERSION" https://github.com/apache/tvm "$src"
-          git -C "$src" submodule update --init --depth 1 3rdparty/tvm-ffi
-          # tvm-ffi needs its own submodules (dlpack, libbacktrace) to configure
-          git -C "$src/3rdparty/tvm-ffi" submodule update --init --depth 1
-          build="$RUNNER_TEMP/tvm-build"
-          mkdir -p "$build"
-          cp "$src/cmake/config.cmake" "$build/config.cmake"
-          # runtime only: no LLVM and nothing from the compiler side
-          {
-            echo "set(USE_LLVM OFF)"
-            echo "set(CMAKE_BUILD_TYPE Release)"
-            echo "set(USE_GTEST OFF)"
-          } >> "$build/config.cmake"
-          cross_args=()
-          if [ -n "$CROSS" ]; then
-            cross_args=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=armv7l
-              "-DCMAKE_C_COMPILER=$CROSS-gcc" "-DCMAKE_CXX_COMPILER=$CROSS-g++")
-          fi
-          cmake -S "$src" -B "$build" -G Ninja "${cross_args[@]}"
-          ninja -C "$build" tvm_runtime
-          for library in libtvm_runtime.so libtvm_ffi.so; do
-            machine="$(readelf -h "$build/lib/$library" | sed -n 's/^ *Machine: *//p')"
-            if [ "$machine" != "${{ matrix.elf_machine }}" ]; then
-              echo "::error::$library was built for '$machine', expected '${{ matrix.elf_machine }}'"
-              exit 1
-            fi
+          python3 scripts/check-image-tag.py "ghcr.io/scc-digitalhub/tvm-runtime-rust:$CPU_TAG" \
+            "ghcr.io/scc-digitalhub/tvm-runtime-rust:$CUDA_TAG"
+          for arch in amd64 arm64 armv7; do
+            python3 scripts/check-image-tag.py "ghcr.io/scc-digitalhub/tvm-runtime-rust:$CPU_TAG-$arch"
           done
-          {
-            echo "TVM_SRC=$src"
-            echo "TVM_BUILD=$build"
-            echo "TVM_GIT_COMMIT=$(git -C "$src" rev-parse HEAD)"
-            echo "TVM_FFI_GIT_COMMIT=$(git -C "$src/3rdparty/tvm-ffi" rev-parse HEAD)"
-          } >> "$GITHUB_ENV"
-
-      - name: Build tvm-serve
-        run: |
-          # the tvm-ffi Rust crates do not compile for 32-bit targets upstream (see the patch
-          # header); on 64-bit targets the patched lines are compiled out
-          patch -p1 --forward -d "$TVM_SRC/3rdparty/tvm-ffi" < patches/tvm-ffi-rust-32bit.patch
-          chmod +x scripts/tvm-ffi-config
-          ln -sfn "$TVM_SRC/3rdparty/tvm-ffi/rust" .tvm-ffi-rust
-          # tvm-ffi-sys also links -ltvm_ffi_testing, which the image does not ship: an empty stub
-          # satisfies the linker and --as-needed keeps it out of tvm-serve (checked below)
-          "${TOOL_PREFIX}gcc" -shared -x c /dev/null -o "$TVM_BUILD/lib/libtvm_ffi_testing.so"
-          linker_var="CARGO_TARGET_$(echo "$RUST_TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
-          export "$linker_var=${TOOL_PREFIX}gcc"
-          PATH="$GITHUB_WORKSPACE/scripts:$PATH" \
-            TVM_BUILD_DIR="$TVM_BUILD" \
-            TVM_FFI_LIBDIR="$TVM_BUILD/lib" \
-            cargo build --locked --release --target "$RUST_TARGET" --bin tvm-serve
-          needed="$("${TOOL_PREFIX}readelf" -d "target/$RUST_TARGET/release/tvm-serve")"
-          for library in libtvm_ffi.so libtvm_runtime.so; do
-            if ! grep -F "Shared library: [$library]" <<<"$needed" >/dev/null; then
-              echo "::error::tvm-serve is not linked to $library"
-              exit 1
-            fi
+          for arch in amd64 arm64; do
+            python3 scripts/check-image-tag.py "ghcr.io/scc-digitalhub/tvm-runtime-rust:$CUDA_TAG-$arch"
           done
-          if grep -F "libtvm_ffi_testing" <<<"$needed"; then
-            echo "::error::tvm-serve needs libtvm_ffi_testing.so, which the image does not ship"
-            exit 1
-          fi
-          if grep -E 'NEEDED.*(libcuda|libnvidia|libtvm_runtime_cuda)' <<<"$needed"; then
-            echo "::error::CPU binary unexpectedly depends on NVIDIA libraries"
-            exit 1
-          fi
 
-      - name: Test native TVM runtime and inference transports
-        if: matrix.cross == ''
-        run: |
-          python3 scripts/test_verify_tvm_build.py
-          PATH="$GITHUB_WORKSPACE/scripts:$PATH" \
-            TVM_BUILD_DIR="$TVM_BUILD" \
-            TVM_FFI_LIBDIR="$TVM_BUILD/lib" \
-            LD_LIBRARY_PATH="$TVM_BUILD/lib" \
-            cargo test --locked --release --target "$RUST_TARGET" -p tvm-relax -p tvm-serve
+  cpu:
+    needs: release
+    uses: ./.github/workflows/tvm-runtime-rust-cpu-build.yml
+    with:
+      release_tag: ${{ needs.release.outputs.release }}
+      source_sha: ${{ needs.release.outputs.source_sha }}
+      image_tag: ${{ needs.release.outputs.cpu_tag }}
+      tvm_version: ${{ needs.release.outputs.tvm_version }}
+      ffi_version: ${{ needs.release.outputs.ffi_version }}
+      tvm_commit: ${{ needs.release.outputs.tvm_commit }}
+      ffi_commit: ${{ needs.release.outputs.ffi_commit }}
+      publish: ${{ github.event_name == 'push' || inputs.publish }}
+      manifest_run_id: ${{ inputs.manifest_run_id || '' }}
 
-      - name: Stage the image build context
-        run: |
-          # same layout build-image.sh produces: lib/, tvm-serve and provenance.json at the root
-          rm -rf lib evidence tvm-serve provenance.json .tvm-ffi-rust
-          mkdir -p lib evidence
-          cp "$TVM_BUILD/lib/libtvm_runtime.so" "$TVM_BUILD/lib/libtvm_ffi.so" lib/
-          "${TOOL_PREFIX}strip" --strip-debug lib/*.so
-          cp "target/$RUST_TARGET/release/tvm-serve" tvm-serve
-          python3 - "." <<'PY'
-          import datetime
-          import hashlib
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          target = Path(sys.argv[1])
-          run_url = "{}/{}/actions/runs/{}".format(
-              os.environ["GITHUB_SERVER_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]
-          )
-          manifest = {
-              "schema_version": 1,
-              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "platform": os.environ["PLATFORM"],
-              "source_repository": os.environ["GITHUB_REPOSITORY"],
-              "source_git_commit": os.environ["GITHUB_SHA"],
-              "image_tag": os.environ["IMAGE_TAG"],
-              "tvm_version": os.environ["TVM_VERSION"],
-              "tvm_git_commit": os.environ["TVM_GIT_COMMIT"],
-              "tvm_ffi_version": os.environ["TVM_FFI_VERSION"],
-              "tvm_ffi_git_commit": os.environ["TVM_FFI_GIT_COMMIT"],
-              "compiled_backends": ["cpu"],
-              "libraries_from": "apache/tvm v{} runtime, built by this workflow".format(os.environ["TVM_VERSION"]),
-              "build_run": run_url,
-              "libraries": {
-                  lib.name: hashlib.sha256(lib.read_bytes()).hexdigest()
-                  for lib in sorted((target / "lib").glob("*.so"))
-              },
-          }
-          (target / "provenance.json").write_text(json.dumps(manifest, indent=2) + "\n")
-          print(json.dumps(manifest, indent=2))
-          PY
-
-      - name: Build image
-        run: |
-          docker build --platform "$PLATFORM" -t "$REF" \
-            --build-arg "TVM_VERSION=$TVM_VERSION" \
-            --build-arg "TVM_GIT_COMMIT=$TVM_GIT_COMMIT" \
-            --build-arg "TVM_FFI_VERSION=$TVM_FFI_VERSION" \
-            --build-arg "TVM_FFI_GIT_COMMIT=$TVM_FFI_GIT_COMMIT" \
-            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.description=$DESCRIPTION" \
-            --label "org.digitalhub.source.revision=$GITHUB_SHA" \
-            .
-          actual="$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$REF")"
-          if [ "$actual" = "linux/arm" ]; then
-            actual="$actual/$(docker image inspect -f '{{.Variant}}' "$REF")"
-          fi
-          if [ "$actual" != "$PLATFORM" ]; then
-            echo "::error::built $actual instead of $PLATFORM"
-            exit 1
-          fi
-          for library in libtvm_runtime.so libtvm_ffi.so; do
-            want="$(sha256sum "lib/$library" | cut -d' ' -f1)"
-            got="$(docker run --rm --platform "$PLATFORM" --entrypoint /usr/bin/sha256sum "$REF" "/opt/tvm/lib/$library" | cut -d' ' -f1)"
-            if [ "$want" != "$got" ]; then
-              echo "::error::$library in $REF differs from the one built here"
-              exit 1
-            fi
-          done
-          # every shared library tvm-serve needs must resolve inside the image
-          docker run --rm --platform "$PLATFORM" --entrypoint /bin/sh "$REF" -c '! ldd /usr/local/bin/tvm-serve | grep "not found"'
-
-      - name: Push image
-        run: |
-          python3 scripts/check-image-tag.py "$REF"
-          docker push "$REF"
-          docker image inspect --format '{{json .RepoDigests}}' "$REF" > repo-digests.json
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          pattern = re.escape(os.environ["IMAGE"]) + r"@sha256:[0-9a-f]{64}"
-          digests = [value for value in json.loads(Path("repo-digests.json").read_text())
-                     if re.fullmatch(pattern, value)]
-          if len(digests) != 1:
-              raise SystemExit("Expected one pushed digest for " + os.environ["IMAGE"])
-          Path("digests").mkdir(exist_ok=True)
-          Path("digests", os.environ["ARCH"] + ".txt").write_text(digests[0] + "\n")
-          PY
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: image-digest-${{ matrix.arch }}
-          path: digests/${{ matrix.arch }}.txt
-          overwrite: true
-          if-no-files-found: error
-
-  manifest:
-    needs: [version, build]
-    runs-on: ubuntu-24.04
-    env:
-      TAG: ${{ needs.version.outputs.tag }}
-      TVM_VERSION: ${{ needs.version.outputs.tvm }}
-      TVM_FFI_VERSION: ${{ needs.version.outputs.ffi }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: image-digest-*
-          path: digests
-          merge-multiple: true
-
-      - name: Verify image digests and revisions
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          import subprocess
-          from pathlib import Path
-
-          architectures = {"amd64": "amd64", "arm64": "arm64", "armv7": "arm"}
-          if {path.name for path in Path("digests").iterdir()} != {arch + ".txt" for arch in architectures}:
-              raise SystemExit("Expected one digest artifact for each architecture")
-          expected = {
-              "org.digitalhub.source.revision": os.environ["GITHUB_SHA"],
-              "org.opencontainers.image.source": os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"],
-              "org.opencontainers.image.version": os.environ["TVM_VERSION"],
-              "org.digitalhub.tvm-ffi.version": os.environ["TVM_FFI_VERSION"],
-          }
-          revisions = set()
-          for arch, machine in architectures.items():
-              reference = Path("digests", arch + ".txt").read_text().strip()
-              if not re.fullmatch(re.escape(os.environ["IMAGE"]) + r"@sha256:[0-9a-f]{64}", reference):
-                  raise SystemExit("Invalid image digest for " + arch)
-              image = json.loads(subprocess.check_output(
-                  ["docker", "buildx", "imagetools", "inspect", "--format", "{{json .Image}}", reference],
-                  text=True,
-              ))
-              if (image.get("os"), image.get("architecture")) != ("linux", machine):
-                  raise SystemExit("Image architecture mismatch for " + arch)
-              if arch == "armv7" and image.get("variant") != "v7":
-                  raise SystemExit("Image ARM variant mismatch for " + arch)
-              labels = image.get("config", {}).get("Labels", {})
-              for key, value in expected.items():
-                  if labels.get(key) != value:
-                      raise SystemExit("Image label mismatch for " + arch + ": " + key)
-              commits = (labels.get("org.opencontainers.image.revision", ""),
-                         labels.get("org.digitalhub.tvm-ffi.revision", ""))
-              if not all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in commits):
-                  raise SystemExit("Missing TVM/FFI commits for " + arch)
-              revisions.add(commits)
-          if len(revisions) != 1:
-              raise SystemExit("Images were built from different TVM/FFI commits")
-          PY
-
-      - name: Publish the multi-arch tag
-        run: |
-          mapfile -t references < <(cat digests/amd64.txt digests/arm64.txt digests/armv7.txt)
-          python3 scripts/check-image-tag.py "$IMAGE:$TAG"
-          docker buildx imagetools create -t "$IMAGE:$TAG" \
-            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
-            --annotation "index:org.digitalhub.source.revision=$GITHUB_SHA" \
-            "${references[@]}"
-          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > index.json
-          python3 - index.json <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          index = json.load(open(sys.argv[1]))
-          expected = {
-              platform: Path("digests", arch + ".txt").read_text().strip().split("@", 1)[1]
-              for platform, arch in (("linux/amd64", "amd64"), ("linux/arm64", "arm64"), ("linux/arm/v7", "armv7"))
-          }
-          actual = []
-          for manifest in index.get("manifests", []):
-              platform = manifest.get("platform", {})
-              if platform.get("os") == "unknown":
-                  continue
-              name = platform["os"] + "/" + platform["architecture"]
-              if platform["architecture"] == "arm":
-                  name += "/" + platform["variant"]
-              actual.append((name, manifest["digest"]))
-          print("platforms:", sorted(name for name, digest in actual))
-          if sorted(actual) != sorted(expected.items()):
-              raise SystemExit("Published manifest does not match the verified image digests and platforms")
-          PY
-          {
-            echo "### Published \`$IMAGE:$TAG\` (linux/amd64, linux/arm64, linux/arm/v7)"
-            echo ""
-            echo "On the first publish make the package public: organization → Packages → ${IMAGE##*/} → Package settings."
-          } >> "$GITHUB_STEP_SUMMARY"
+  cuda:
+    needs: release
+    uses: ./.github/workflows/tvm-runtime-rust-cuda-image.yml
+    with:
+      release_tag: ${{ needs.release.outputs.release }}
+      source_sha: ${{ needs.release.outputs.source_sha }}
+      image_tag: ${{ needs.release.outputs.cuda_tag }}
+      tvm_version: ${{ needs.release.outputs.tvm_version }}
+      ffi_version: ${{ needs.release.outputs.ffi_version }}
+      tvm_commit: ${{ needs.release.outputs.tvm_commit }}
+      ffi_commit: ${{ needs.release.outputs.ffi_commit }}
+      publish: ${{ github.event_name == 'push' || inputs.publish }}
+      manifest_run_id: ${{ inputs.manifest_run_id || '' }}
