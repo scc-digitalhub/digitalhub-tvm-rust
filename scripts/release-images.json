@@ -1,0 +1,7 @@
+{
+  "tvm_version": "0.26.0",
+  "ffi_version": "0.1.13.post2",
+  "tvm_commit": "c7b458e946bc4266915da582457476bdcd9705ae",
+  "ffi_commit": "12dbf053b3d9ba4ebd9da3123b1aeca79cf74229",
+  "cuda_version": "13.2.1"
+}

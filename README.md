@@ -230,25 +230,22 @@ for the Function/Task/Run relationship and target configuration.
 
 ## Versions and release
 
-The current image is `ghcr.io/scc-digitalhub/tvm-runtime-rust:0.26.0-r2`, built
-with Apache TVM `0.26.0`. To publish the latest `main` with the same TVM release,
-run the image workflow, replacing `<new-image-tag>` with a new, unused image tag:
+Push a project release tag `X.Y.Z` to build CPU and CUDA images automatically.
+Image tags include the project release and TVM version, for example
+`ghcr.io/scc-digitalhub/tvm-runtime-rust:0.16.1-tvm0.26.0`.
+To publish an existing source tag using the release workflow on `main`:
 
 ```bash
 gh workflow run tvm-runtime-rust-image.yml \
   --repo scc-digitalhub/digitalhub-tvm-rust --ref main \
-  -f tvm_version=0.26.0 -f image_tag='<new-image-tag>'
+  -f release_tag=0.16.1 -f publish=true
 ```
 
-Manual publication accepts only `main`. It builds that run's source commit and publishes
-`tvm-runtime-rust:<image_tag>`, plus `-amd64`, `-arm64` and `-armv7` tags. Use a new image
-tag for each release to preserve earlier images. Reusing a tag replaces its images;
-it does not move a Git tag. The image tag can contain at most 122 characters, leaving
-room for the architecture suffix.
-
-The existing Git tag workflow remains available: pushing `0.26.0` publishes image
-`0.26.0` from that tagged commit with Apache TVM `0.26.0`; a tag `X.Y` selects TVM `X.Y.0`.
-Merging into `main` does not publish images automatically.
+The source tag must include `scripts/release-images.json`, which pins TVM and TVM-FFI.
+Existing image tags are rejected and earlier releases remain unchanged.
+Merging into `main` does not publish images automatically. See
+[Project releases and image tags](#project-releases-and-image-tags) for naming,
+validation and manifest recovery.
 
 For each architecture, `.github/workflows/tvm-runtime-rust-image.yml`:
 
@@ -266,10 +263,8 @@ the multi-architecture tag from the exact image digests produced by this run.
 revisions and library hashes. The label `org.digitalhub.source.revision` identifies the
 runtime source commit; the existing TVM/FFI labels retain their meaning.
 
-CUDA has a separate manual workflow, `tvm-runtime-rust-cuda-image.yml`, covering
-AMD64/ARM64. Its `publish` input defaults to `false`; publication must be explicitly
-requested from `main` and uses a distinct CUDA image tag. No CUDA release is
-published by these development instructions, and the existing CPU tags are retained.
+The release workflow also invokes `tvm-runtime-rust-cuda-image.yml` for AMD64/ARM64.
+CUDA uses separate image tags and never replaces the CPU images.
 
 ## Development
 
@@ -361,3 +356,49 @@ directory. CPU publication rejects CUDA tags, CUDA tags require a `cuda13.2.1`
 component, and publication checks both architecture tags and the final manifest.
 Existing registry tags and failed lookups stop publication. Rebuilt releases need
 new tags. These guards do not publish any image by themselves.
+
+## Project releases and image tags
+
+A project Git tag such as `0.16.1` identifies this repository's source release.
+It is independent of Apache TVM (`0.26.0`) and CUDA (`13.2.1`). The supported
+TVM/FFI commits and dependency versions are recorded in `scripts/release-images.json`.
+Changing CUDA requires updating and validating its pinned build recipes as well.
+
+Pushing a project tag `X.Y.Z` starts `tvm-runtime-rust-image.yml`. It builds CPU and CUDA
+images from the exact source tag and generates these tags automatically:
+
+```text
+ghcr.io/scc-digitalhub/tvm-runtime-rust:0.16.1-tvm0.26.0
+ghcr.io/scc-digitalhub/tvm-runtime-rust:0.16.1-tvm0.26.0-cuda13.2.1
+```
+
+Each tag is a multi-architecture index. Individual images have `-amd64` and
+`-arm64` suffixes. Rust/Go CPU images also include `-armv7` (cross-built and checked under QEMU).
+CUDA images remain separate from CPU images. GPU execution, accuracy and Jetson
+qualification require hardware and are not certified by hosted CI runners.
+
+The image labels and provenance distinguish the project release, its source
+commit, the build-recipe commit and the upstream TVM/FFI revisions. Existing
+image tags cannot be overwritten. Updating these images does not change CORE's
+configured image references automatically.
+
+The same workflow supports manual execution for a source tag containing its
+dependency configuration:
+
+```bash
+gh workflow run tvm-runtime-rust-image.yml --ref main \
+  -f release_tag=0.16.1 -f publish=true
+```
+
+The workflow recipe is taken from the selected ref; the source is resolved from
+`release_tag`. Publication requires that tag to exist and be an ancestor of the
+workflow commit. On a validation branch, `publish=false` builds without pushing;
+a release tag that does not yet exist resolves to that branch commit for validation
+only. No release tag or GitHub Release is created automatically.
+
+To recover a failed manifest, run the updated workflow with the original source
+tag and `manifest_run_id=<previous run ID>`. The build jobs are skipped. Only
+digest artifacts whose platform, release, source commit and TVM/FFI versions match
+are accepted. A matching existing index is reused; a different index is rejected.
+This supports recovery without deleting images or rebuilding successful binaries.
+CPU and CUDA artifacts have separate names.
