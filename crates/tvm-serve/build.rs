@@ -35,6 +35,11 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
     println!("cargo:rustc-link-arg=-L{lib_dir}");
     println!("cargo:rustc-link-arg=-ltvm_runtime");
+    if env::var_os("CARGO_FEATURE_CUDA").is_some() {
+        // CUDA's device API and module loader also register through static initialization.
+        println!("cargo:rustc-link-arg=-ltvm_runtime_cuda");
+        println!("cargo:rerun-if-changed={lib_dir}/libtvm_runtime_cuda.so");
+    }
     println!("cargo:rustc-link-arg=-Wl,--as-needed");
 
     // Keep the release binary independent from the build host path.

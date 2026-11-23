@@ -10,6 +10,10 @@ description = "Server Open Inference v2 (KServe) per modelli TVM Relax, sopra tv
 name = "tvm-serve"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["tvm-relax/cuda"]
+
 [dependencies]
 tvm-relax = { path = "../tvm-relax" }
 tvm-ffi.workspace = true

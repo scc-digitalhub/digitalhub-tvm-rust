@@ -81,8 +81,14 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(|| async { "tvm-serve · Open Inference v2" }))
-        .route("/v2/health/live", get(|| async { StatusCode::OK }))
-        .route("/v2/health/ready", get(|| async { StatusCode::OK }))
+        .route(
+            "/v2/health/live",
+            get(|| async { Json(serde_json::json!({})) }),
+        )
+        .route(
+            "/v2/health/ready",
+            get(|| async { Json(serde_json::json!({})) }),
+        )
         .route("/v2", get(server_metadata))
         .route("/v2/models/:name", get(model_metadata))
         .route("/v2/models/:name/ready", get(model_ready))
@@ -181,11 +187,14 @@ fn to_tensor_metadata(s: &tvm_relax::TensorSpec) -> TensorMetadata {
     }
 }
 
-async fn model_ready(State(state): State<AppState>, Path(name): Path<String>) -> StatusCode {
+async fn model_ready(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     if name == state.handle.model_name {
-        StatusCode::OK
+        Ok(Json(serde_json::json!({})))
     } else {
-        StatusCode::NOT_FOUND
+        Err(StatusCode::NOT_FOUND)
     }
 }
 

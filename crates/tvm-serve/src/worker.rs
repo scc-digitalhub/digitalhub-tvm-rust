@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tvm_ffi::{DLDataTypeCode, Tensor};
+use tvm_ffi::{AnyView, DLDataTypeCode, DLDeviceType, Function, Tensor};
 use tvm_relax::{Metadata, RelaxModel, TensorSpec};
 
 use crate::protocol::TensorData;
@@ -53,6 +53,171 @@ pub enum ServeErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_tensor_round_trip_preserves_supported_types() {
+        let inputs = [
+            TensorData::F32(vec![1.25, -2.5]),
+            TensorData::F64(vec![1.25, -2.5]),
+            TensorData::I8(vec![i8::MIN, i8::MAX]),
+            TensorData::I16(vec![i16::MIN, i16::MAX]),
+            TensorData::I32(vec![i32::MIN, i32::MAX]),
+            TensorData::I64(vec![i64::MIN, i64::MAX]),
+            TensorData::U8(vec![0, u8::MAX]),
+            TensorData::U16(vec![0, u16::MAX]),
+            TensorData::U32(vec![0, u32::MAX]),
+            TensorData::U64(vec![0, u64::MAX]),
+        ];
+        for data in inputs {
+            let tensor = build_tensor(&data, &[1, 2]).unwrap();
+            let (actual, dtype) = read_tensor(&tensor).unwrap();
+            assert_eq!(actual.datatype(), dtype);
+            assert_eq!(actual.to_json(), data.to_json());
+
+            let shape = tvm_ffi::Shape::from(&[1i64][..]);
+            let dtype = tensor.dtype();
+            let view: Tensor = Function::get_global("runtime.TVMTensorCreateView")
+                .unwrap()
+                .call_packed(&[
+                    AnyView::from(&tensor),
+                    AnyView::from(&shape),
+                    AnyView::from(&dtype),
+                    AnyView::from(&u64::from(dtype.bits / 8)),
+                ])
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let (actual, _) = read_tensor(&view).unwrap();
+            assert_eq!(actual.to_json(), serde_json::json!([data.to_json()[1]]));
+        }
+    }
+
+    /// Validate the pinned runtime's FFI ABI on CPU, including copying into a
+    /// TVM-owned allocation. CUDA staging uses these same registered functions.
+    #[test]
+    fn standard_tvm_tensor_transfer_globals_work_without_gpu() {
+        use tvm_ffi::{AnyView, DLDevice, DLDeviceType, Function, Shape};
+        let source = Tensor::from_slice(&[1.25f32, -2.5], &[1, 2]).unwrap();
+        let shape = Shape::from(source.shape());
+        let dtype = source.dtype();
+        let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
+        let alloc = Function::get_global("runtime.TVMTensorAllocWithScope").unwrap();
+        let target: Tensor = alloc
+            .call_packed(&[
+                AnyView::from(&shape),
+                AnyView::from(&dtype),
+                AnyView::from(&device),
+                AnyView::new(),
+            ])
+            .unwrap()
+            .try_into()
+            .unwrap();
+        Function::get_global("runtime.TVMTensorCopyFromTo")
+            .unwrap()
+            .call_tuple((&source, &target))
+            .unwrap();
+        Function::get_global("runtime.Device_StreamSync")
+            .unwrap()
+            .call_packed(&[AnyView::from(&device), AnyView::from(&0i64)])
+            .unwrap();
+        assert_eq!(target.data_as_slice::<f32>().unwrap(), &[1.25, -2.5]);
+        assert_eq!(target.shape(), &[1, 2]);
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cuda_image_fails_clearly_without_a_visible_gpu() {
+        if std::env::var_os("TVM_TEST_REQUIRE_NO_CUDA").is_none() {
+            return;
+        }
+        let error = RelaxModel::load("/no/model.so", "main", tvm_relax::Backend::Cuda)
+            .err()
+            .expect("this test requires a GPU-less runner");
+        assert!(
+            error.to_string().contains("CUDA device 0 is unavailable"),
+            "{error}"
+        );
+    }
+
+    /// Explicit hardware gate: NOT_RUN in ordinary CPU/no-GPU test runs.
+    /// The fixture contains inputs/outputs with name, shape and FP32 data vectors.
+    #[tokio::test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires a visible NVIDIA GPU, precompiled CUDA model and FP32 reference fixture"]
+    async fn cuda_fp32_fixture_copies_inputs_and_outputs() {
+        #[derive(serde::Deserialize)]
+        struct FixtureTensor {
+            name: String,
+            shape: Vec<i64>,
+            data: Vec<f32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            inputs: Vec<FixtureTensor>,
+            outputs: Vec<FixtureTensor>,
+            #[serde(default = "tolerance")]
+            atol: f32,
+            #[serde(default = "tolerance")]
+            rtol: f32,
+        }
+        fn tolerance() -> f32 {
+            1e-5
+        }
+        let directory = std::env::var("TVM_TEST_CUDA_MODEL_DIR")
+            .expect("TVM_TEST_CUDA_MODEL_DIR must contain model.so and metadata.json");
+        let data_path = std::env::var("TVM_TEST_CUDA_DATA")
+            .unwrap_or_else(|_| format!("{directory}/cuda-test.json"));
+        let fixture: Fixture =
+            serde_json::from_str(&std::fs::read_to_string(data_path).unwrap()).unwrap();
+        assert!(!fixture.inputs.is_empty() && !fixture.outputs.is_empty());
+        assert!(fixture.atol.is_finite() && fixture.atol >= 0.0);
+        assert!(fixture.rtol.is_finite() && fixture.rtol >= 0.0);
+        let metadata = Metadata::from_file(&format!("{directory}/metadata.json")).unwrap();
+        assert_eq!(
+            metadata
+                .validate_runtime(
+                    RUNTIME_TVM_VERSION,
+                    RUNTIME_TVM_GIT_COMMIT,
+                    std::env::consts::ARCH
+                )
+                .unwrap(),
+            tvm_relax::Backend::Cuda
+        );
+        let handle = start(&directory, "cuda-fixture".into(), 1).unwrap();
+        // Repeated requests also exercise device tensor ownership and pooled VM allocations.
+        for _ in 0..3 {
+            let inputs = fixture
+                .inputs
+                .iter()
+                .map(|input| InferInput {
+                    name: input.name.clone(),
+                    shape: input.shape.clone(),
+                    data: TensorData::F32(input.data.clone()),
+                })
+                .collect();
+            let outputs = handle
+                .serve_infer("cuda-fixture", inputs)
+                .await
+                .unwrap_or_else(|error| panic!("CUDA fixture inference failed: {error:?}"));
+            assert_eq!(outputs.len(), fixture.outputs.len());
+            for (actual, expected) in outputs.iter().zip(&fixture.outputs) {
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.shape, expected.shape);
+                let TensorData::F32(values) = &actual.data else {
+                    panic!("expected FP32 output")
+                };
+                assert_eq!(values.len(), expected.data.len());
+                for (i, (&value, &reference)) in values.iter().zip(&expected.data).enumerate() {
+                    assert!(value.is_finite() && reference.is_finite());
+                    assert!(
+                        (value - reference).abs() <= fixture.atol + fixture.rtol * reference.abs(),
+                        "output {}[{i}]: {value} != {reference}",
+                        expected.name
+                    );
+                }
+            }
+        }
+    }
 
     fn handle() -> Handle {
         let (tx, _) = mpsc::channel(1);
@@ -333,7 +498,7 @@ impl Handle {
 /// the model so `ready` is real. `workers` is clamped to at least 1.
 pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Result<Handle> {
     let meta = Metadata::from_file(&format!("{model_dir}/metadata.json"))?;
-    meta.validate_runtime(
+    let backend = meta.validate_runtime(
         RUNTIME_TVM_VERSION,
         RUNTIME_TVM_GIT_COMMIT,
         std::env::consts::ARCH,
@@ -373,7 +538,7 @@ pub fn start(model_dir: &str, model_name: String, workers: usize) -> anyhow::Res
         std::thread::Builder::new()
             .name(format!("tvm-infer-{w}"))
             .spawn(move || {
-                let model = match RelaxModel::load(&so_path, &entry) {
+                let model = match RelaxModel::load(&so_path, &entry, backend) {
                     Ok(m) => {
                         let _ = ready_tx.send(Ok(()));
                         m
@@ -433,7 +598,8 @@ fn run_one(
     let mut tensors = Vec::with_capacity(inputs.len());
     for (i, inp) in inputs.iter().enumerate() {
         crate::protocol::validate_shape(i, &inp.shape, inp.data.len())?;
-        tensors.push(build_tensor(&inp.data, &inp.shape)?);
+        let cpu = build_tensor(&inp.data, &inp.shape)?;
+        tensors.push(model.input_from_cpu(cpu).map_err(|e| e.to_string())?);
     }
 
     let outs = model.run(&tensors).map_err(|e| e.to_string())?;
@@ -441,7 +607,8 @@ fn run_one(
     let mut result = Vec::with_capacity(outs.len());
     for (i, t) in outs.iter().enumerate() {
         // Output dtype comes from the tensor, not metadata (so int64 indices report INT64).
-        let (data, datatype) = read_tensor(t)?;
+        let cpu = model.output_to_cpu(t).map_err(|e| e.to_string())?;
+        let (data, datatype) = read_tensor(&cpu)?;
         let name = outputs_meta
             .get(i)
             .map(|s| s.name.clone())
@@ -473,10 +640,15 @@ fn build_tensor(data: &TensorData, shape: &[i64]) -> Result<Tensor, String> {
     r.map_err(|e| format!("Tensor::from_slice: {e:?}"))
 }
 
-// Read an output tensor into typed data + its v2 datatype, dispatching on the
-// actual DLDataType. data_as_slice::<T> is safe because T matches that dtype.
+// TVM's copy API respects byte_offset and rejects unsupported layouts. The pinned
+// Rust data_as_slice implementation ignores byte_offset, even for contiguous views.
 fn read_tensor(t: &Tensor) -> Result<(TensorData, &'static str), String> {
     let dt = t.dtype();
+    if t.device().device_type != DLDeviceType::kDLCPU || dt.lanes != 1 {
+        return Err("output must be a CPU tensor with one dtype lane".into());
+    }
+    let copy = Function::get_global("runtime.TVMTensorCopyToBytes")
+        .map_err(|e| format!("output copy function: {e:?}"))?;
     let (code, bits) = (dt.code, dt.bits);
     let fl = DLDataTypeCode::kDLFloat as u8;
     let si = DLDataTypeCode::kDLInt as u8;
@@ -484,10 +656,20 @@ fn read_tensor(t: &Tensor) -> Result<(TensorData, &'static str), String> {
 
     macro_rules! read {
         ($ty:ty, $variant:path, $v2:expr) => {{
-            let s = t
-                .data_as_slice::<$ty>()
-                .map_err(|e| format!("output data_as_slice: {e:?}"))?;
-            Ok(($variant(s.to_vec()), $v2))
+            let mut values = vec![0 as $ty; t.numel()];
+            let bytes = values
+                .len()
+                .checked_mul(std::mem::size_of::<$ty>())
+                .ok_or_else(|| "output byte size overflow".to_string())?;
+            if bytes != 0 {
+                copy.call_packed(&[
+                    AnyView::from(t),
+                    AnyView::from(&values.as_mut_ptr().cast::<std::ffi::c_void>()),
+                    AnyView::from(&bytes),
+                ])
+                .map_err(|e| format!("output TVMTensorCopyToBytes: {e:?}"))?;
+            }
+            Ok(($variant(values), $v2))
         }};
     }
 

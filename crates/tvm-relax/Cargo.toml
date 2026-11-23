@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "Rust Wrapper over tvm-ffi: load a model.so Relax and run the TVM VirtualMachine."
 
+[features]
+default = []
+cuda = []
+
 [dependencies]
 tvm-ffi.workspace = true
 serde.workspace = true
