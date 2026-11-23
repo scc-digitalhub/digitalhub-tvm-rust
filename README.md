@@ -290,7 +290,6 @@ export TVM_BUILD_DIR="$TVM/build" TVM_FFI_LIBDIR="$TVM/build/lib"
 export PATH="$PWD/scripts:$PATH" LD_LIBRARY_PATH="$TVM/build/lib"
 export TVM_VERSION=0.26.0 TVM_GIT_COMMIT="$(git -C "$TVM" rev-parse HEAD)"
 
-cargo test -p tvm-relax -p tvm-serve
 cargo build --release --bin tvm-serve
 ```
 
@@ -313,22 +312,6 @@ scratch without deleting an existing cache, set `CARGO_TARGET_DIR` to a new dire
 For a manual CUDA binary build, add `--features cuda` to the Cargo command and use
 the matching CUDA-enabled TVM libraries. A build or an unavailable-device check
 does not substitute for repeated numerical inference on actual NVIDIA hardware.
-`TVM_TEST_REQUIRE_NO_CUDA=1 cargo test --locked --features cuda -p tvm-relax -p tvm-serve`
-enables the unavailable-device assertions. An isolated driver-stub loader path can
-be used for that test process only; never for real inference or runtime images.
-
-The opt-in hardware test sends repeated FP32 requests through the worker, checking
-copies, synchronization and expected outputs:
-
-```bash
-TVM_TEST_CUDA_MODEL_DIR=/path/to/cuda-model TVM_TEST_CUDA_DATA=/path/to/cuda-test.json \
-  cargo test --locked --features cuda -p tvm-serve \
-  cuda_fp32_fixture_copies_inputs_and_outputs -- --ignored
-```
-
-The JSON fixture contains `inputs` and `outputs` lists of `{name, shape, data}`
-tensors with FP32 values; optional `atol` and `rtol` default to `1e-5`. This test
-requires actual NVIDIA hardware. Its ignored/default-skipped state is **NOT_RUN**.
 
 ## Limitations
 
