@@ -16,7 +16,7 @@ fn main() {
             env::set_var("PROTOC", p);
         }
     }
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(false)
         .compile_protos(&["proto/grpc_predict_v2.proto"], &["proto"])

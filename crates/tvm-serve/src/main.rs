@@ -90,11 +90,11 @@ async fn main() -> anyhow::Result<()> {
             get(|| async { Json(serde_json::json!({})) }),
         )
         .route("/v2", get(server_metadata))
-        .route("/v2/models/:name", get(model_metadata))
-        .route("/v2/models/:name/ready", get(model_ready))
-        .route("/v2/models/:name/infer", post(infer))
+        .route("/v2/models/{name}", get(model_metadata))
+        .route("/v2/models/{name}/ready", get(model_ready))
+        .route("/v2/models/{name}/infer", post(infer))
         .route(
-            "/v2/models/:name/versions/:version/infer",
+            "/v2/models/{name}/versions/{version}/infer",
             post(infer_versioned),
         )
         // axum default body limit is 2MB; yolov8n FP32 input is ~12MB. Cap at 1 GiB.
@@ -233,7 +233,6 @@ async fn infer_versioned(
 
 struct InferJson(InferRequest);
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequest<S> for InferJson {
     type Rejection = (StatusCode, String);
 
